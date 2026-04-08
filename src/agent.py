@@ -1,6 +1,6 @@
 """
 Agente de Eventos — João Pessoa, PB
-- Busca diária de eventos com OpenAI GPT-4o
+- Busca diária de eventos com OpenAI GPT
 - Envia via WhatsApp (Evolution API)
 - Memória de eventos já enviados (sem repetição)
 - Cobre: tech, IA, marketing, negócios, empreendedorismo, saúde/clínicas
@@ -11,7 +11,11 @@ import json
 import hashlib
 import httpx
 from datetime import datetime
+from dotenv import load_dotenv # <-- 1. ADICIONADO: Importa a biblioteca do .env
 from openai import OpenAI
+
+# <-- 2. ADICIONADO: Carrega as chaves do arquivo .env antes de chamar a OpenAI
+load_dotenv() 
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
@@ -322,7 +326,7 @@ def rodar_agente():
         iteracoes += 1
 
         resposta = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini", # <-- 3. ALTERADO: Troquei de gpt-4o para gpt-4o-mini como você pediu
             messages=[{"role": "system", "content": SYSTEM_PROMPT}] + mensagens,
             tools=TOOLS,
             tool_choice="auto",
@@ -361,42 +365,4 @@ def rodar_agente():
                 mensagem = formatar_mensagem_wpp(eventos_novos, len(eventos_finais))
 
                 # Salva em arquivo sempre
-                caminho = f"relatorio_{datetime.now().strftime('%Y-%m-%d')}.txt"
-                with open(caminho, "w", encoding="utf-8") as f:
-                    f.write(mensagem)
-                print(f"💾 Salvo em: {caminho}")
-                print("\n" + "─"*40)
-                print(mensagem[:800])
-                print("─"*40)
-
-                # Envia WhatsApp
-                enviado = enviar_whatsapp(mensagem)
-
-                # Atualiza memória
-                if enviado or True:  # salva na memória mesmo se WPP falhar
-                    for ev in eventos_novos:
-                        memoria.add(ev["_id"])
-                    salvar_memoria(memoria)
-                    print(f"📂 Memória atualizada: {len(memoria)} eventos registrados")
-
-                # Retorna resultado para o modelo
-                mensagens.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": f"Enviado. {len(eventos_novos)} eventos novos de {len(eventos_finais)} encontrados."
-                })
-
-                return  # encerra após enviar
-
-            elif nome == "buscar_eventos_web":
-                print(f"🔍 Buscando: {args.get('query', '')}")
-                resultado = executar_tool(nome, args)
-                mensagens.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": resultado
-                })
-
-
-if __name__ == "__main__":
-    rodar_agente()
+                caminho = f"relatorio
