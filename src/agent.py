@@ -282,28 +282,43 @@ def formatar_mensagem(eventos_novos: list, total: int) -> str:
 SYSTEM_PROMPT = """Voce e um agente especializado em descobrir eventos em Joao Pessoa, PB, Brasil.
 
 REGRAS ABSOLUTAS:
-1. Inclua APENAS eventos em Joao Pessoa ou Paraiba. Descarte qualquer evento de outros estados.
-2. Faca NO MINIMO 20 buscas antes de finalizar. Seja exaustivo.
-3. Para cada evento encontrado, tente acessar a pagina para confirmar preco e detalhes.
-4. Prefira preco real (Gratuito / R$ valor) a "Sob consulta".
+1. Inclua APENAS eventos em Joao Pessoa ou Paraiba. Descarte eventos de outros estados.
+2. Inclua APENAS eventos futuros. Descarte eventos com data anterior a hoje.
+3. Faca NO MINIMO 25 buscas antes de finalizar. Seja exaustivo e varie as queries.
+4. Acesse a pagina de cada evento para confirmar preco real. Evite "Sob consulta".
 
-CATEGORIAS (cubra TODAS nas buscas):
-- Tecnologia, IA, programacao, inovacao, startups
-- Marketing digital, redes sociais, growth, copywriting, criacao de conteudo
-- Empreendedorismo, negocios, vendas, gestao, financas, lideranca
-- Saude: odontologia, medicina estetica, fisioterapia, nutricao, clinicas
+CATEGORIAS — cubra TODAS:
+- Tecnologia, IA, inteligencia artificial, machine learning, inovacao, startups, programacao
+- Marketing digital, growth, redes sociais, trafego pago, copywriting, criacao de conteudo
+- Empreendedorismo, negocios, vendas, gestao, financas, lideranca, RH
+- Saude: odontologia, medicina estetica, fisioterapia, nutricao, enfermagem, gestao de clinicas
 
-PLATAFORMAS (faca buscas em TODAS):
-sympla.com.br, eventbrite.com.br, even3.com.br, doity.com.br, ingresse.com, meetup.com
+PLATAFORMAS — faca buscas especificas em CADA UMA:
+- site:sympla.com.br
+- site:even3.com.br
+- site:doity.com.br
+- site:eventbrite.com.br
+- site:meetup.com
+- site:ingresse.com
 
-ESTRATEGIA DE BUSCA:
-- Combine categoria + cidade: "workshop IA Joao Pessoa 2026"
-- Combine categoria + plataforma: "eventos empreendedorismo JP site:sympla.com.br"  
-- Busque por mes: "eventos Joao Pessoa maio 2026"
-- Busque termos especificos do publico: "congresso odontologia Paraiba", "curso gestor clinica JP"
-- Busque eventos nacionais com edicao em JP: "evento nacional marketing Joao Pessoa"
+ENTIDADES LOCAIS — busque eventos organizados por:
+- SEBRAE Paraiba: "evento SEBRAE Joao Pessoa 2026"
+- ACIPB (Associacao Comercial): "evento ACIPB Joao Pessoa 2026"
+- Startup PB / ecossistema de inovacao: "startup PB evento 2026"
+- CRO-PB (odontologia): "evento CRO Paraiba 2026"
+- CRM-PB (medicina): "evento CRM Paraiba 2026"
+- UFPB / UEPB / Uninassau / IESP: "evento workshop UFPB 2026"
+- SENAC PB: "curso evento SENAC Joao Pessoa 2026"
+- CDL Joao Pessoa: "evento CDL Joao Pessoa 2026"
 
-Apos todas as buscas, acesse as paginas dos eventos mais promissores para pegar preco e detalhes.
+ESTRATEGIA DE BUSCA — varie sempre:
+- Por mes: "eventos Joao Pessoa maio 2026", "eventos JP junho 2026"
+- Por nicho: "congresso odontologia Paraiba 2026", "summit marketing JP 2026"
+- Por formato: "workshop presencial Joao Pessoa 2026", "meetup tech JP 2026"
+- Por publico: "evento donos de clinica Paraiba", "gestor saude evento JP"
+- Geral: "agenda eventos Joao Pessoa 2026", "o que fazer JP abril 2026"
+
+Apos todas as buscas, acesse as paginas dos eventos encontrados para confirmar preco e data.
 So entao chame finalizar_e_enviar."""
 
 
@@ -324,10 +339,11 @@ def rodar_agente():
         "role": "user",
         "content": (
             f"Hoje e {hoje}. Busque TODOS os eventos em Joao Pessoa, PB "
-            f"para os proximos 60 dias. "
-            f"Faca no minimo 20 buscas cobrindo todas as categorias e plataformas. "
-            f"Acesse as paginas dos eventos para confirmar preco e detalhes. "
-            f"Inclua APENAS eventos em JP ou Paraiba."
+            f"para os proximos 90 dias. "
+            f"Faca no minimo 25 buscas cobrindo todas as categorias, plataformas e entidades locais. "
+            f"Acesse as paginas dos eventos para confirmar preco real e data exata. "
+            f"DESCARTE eventos com data anterior a hoje ({hoje}). "
+            f"DESCARTE eventos fora de JP ou Paraiba."
         )
     }]
 
@@ -359,9 +375,34 @@ def rodar_agente():
                 eventos = args.get("eventos", [])
                 print(f"\nTotal encontrado: {len(eventos)} eventos")
 
+                # Filtra eventos passados (garante no codigo, nao so no prompt)
+                hoje_dt = datetime.now().date()
+                eventos_futuros = []
+                for ev in eventos:
+                    data_str = ev.get("data", "")
+                    eh_futuro = True  # se nao tem data, inclui por precaucao
+                    if data_str:
+                        # tenta extrair ano/mes/dia do texto da data
+                        import re
+                        match = re.search(r"(\d{2})/(\d{2})/(\d{4})", data_str)
+                        if match:
+                            try:
+                                from datetime import date
+                                dia, mes, ano = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                                data_ev = date(ano, mes, dia)
+                                eh_futuro = data_ev >= hoje_dt
+                            except Exception:
+                                pass
+                    if eh_futuro:
+                        eventos_futuros.append(ev)
+                    else:
+                        print(f"Descartado (passado): {ev.get('nome', '')} — {data_str}")
+
+                print(f"Eventos futuros: {len(eventos_futuros)} de {len(eventos)}")
+
                 # Filtra ja enviados
                 novos = []
-                for ev in eventos:
+                for ev in eventos_futuros:
                     url = ev.get("url", "") or ev.get("nome", "")
                     ev_id = gerar_id_evento(url)
                     if ev_id not in memoria:
