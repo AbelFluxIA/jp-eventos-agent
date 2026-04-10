@@ -148,8 +148,8 @@ def buscar_eventos_web(query: str) -> str:
             json={
                 "api_key": api_key,
                 "query": query,
-                "search_depth": "advanced",
-                "max_results": 8,
+                "search_depth": "basic",
+                "max_results": 5,
             },
             timeout=20
         )
@@ -162,7 +162,7 @@ def buscar_eventos_web(query: str) -> str:
             saida.append(
                 f"Titulo: {res.get('title', '')}\n"
                 f"URL: {res.get('url', '')}\n"
-                f"Conteudo: {res.get('content', '')[:600]}\n"
+                f"Conteudo: {res.get('content', '')[:250]}\n"
             )
         return "\n---\n".join(saida)
 
@@ -184,7 +184,7 @@ def acessar_pagina_evento(url: str) -> str:
         texto = re.sub(r"\s+", " ", texto).strip()
 
         # Retorna os primeiros 2000 chars que costumam ter as infos principais
-        return texto[:2000]
+        return texto[:1000]
 
     except Exception as e:
         return f"Nao foi possivel acessar a pagina: {e}"
@@ -337,7 +337,7 @@ def rodar_agente():
         iteracoes += 1
 
         resposta = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             messages=[{"role": "system", "content": SYSTEM_PROMPT}] + mensagens,
             tools=TOOLS,
             tool_choice="auto",
