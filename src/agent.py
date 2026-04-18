@@ -1,22 +1,84 @@
 """
-Agente de Eventos — João Pessoa, PB
-- Busca diária com OpenAI GPT-4o
-- Envia via WhatsApp (Evolution API)
-- Memoria de eventos ja enviados (sem repeticao)
-- Busca preco real acessando pagina do evento
-- Filtra eventos fora de JP
+Agente de Eventos — Joao Pessoa + Cidades Proximas
+- Busca eventos relevantes para quem quer palestrar e fazer networking
+- Analisa oportunidades de palestra em cada evento
+- Cobre JP + cidades proximas com filtro de qualidade
+- Envia via WhatsApp com classificacao de oportunidade
 """
 
 import os
 import json
 import hashlib
 import httpx
+import re
 from datetime import datetime
 from openai import OpenAI
 
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+# OpenRouter — compativel com API OpenAI
+# Usa modelo gratuito (Qwen3.6 Plus) com fallback para gpt-4o-mini
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+OPENAI_API_KEY     = os.environ.get("OPENAI_API_KEY")
+
+if OPENROUTER_API_KEY:
+    client = OpenAI(
+        api_key=OPENROUTER_API_KEY,
+        base_url="https://openrouter.ai/api/v1",
+    )
+    MODELO = os.environ.get("MODELO_IA", "qwen/qwen3.6-plus:free")
+    print(f"Usando OpenRouter: {MODELO}")
+else:
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    MODELO = "gpt-4o-mini"
+    print("Usando OpenAI: gpt-4o-mini")
 
 MEMORIA_PATH = "data/eventos_enviados.json"
+
+# --------------------------------------------------
+# PERFIL DO USUARIO (personaliza as analises)
+# --------------------------------------------------
+
+PERFIL = """
+Nome: Abel
+Empresa: Agencia de IA (FluxIA)
+O que faz: Cria agentes de IA personalizados para atendimento, clinicas medicas/odonto/estetica,
+           sistemas SaaS, APIs, automacoes inteligentes
+Quer: Comecar a palestrar, construir autoridade, fazer networking qualificado
+Publico-alvo: Donos de clinicas, empreendedores, profissionais de saude, empresarios locais
+Diferenciais: Agentes que parecem humanos, IA aplicada a negocios reais no Nordeste
+"""
+
+# --------------------------------------------------
+# CIDADES — JP e proximas (com criterio de qualidade)
+# --------------------------------------------------
+
+CIDADES = {
+    "joao_pessoa": {
+        "nome": "Joao Pessoa, PB",
+        "criterio": "todos os eventos relevantes",
+        "distancia": 0,
+    },
+    "campina_grande": {
+        "nome": "Campina Grande, PB",
+        "criterio": "eventos de tecnologia, inovacao, negocios e saude com boa estrutura",
+        "distancia": 130,
+    },
+    "recife": {
+        "nome": "Recife, PE",
+        "criterio": "apenas eventos de grande porte: conferencias, summits, congressos com mais de 200 pessoas",
+        "distancia": 120,
+    },
+    "natal": {
+        "nome": "Natal, RN",
+        "criterio": "apenas eventos de grande porte ou com oportunidade clara de palestra",
+        "distancia": 185,
+    },
+    "fortaleza": {
+        "nome": "Fortaleza, CE",
+        "criterio": "apenas eventos excepcionais — grandes conferencias nacionais com edicao local",
+        "distancia": 500,
+    },
+}
+
 
 # --------------------------------------------------
 # MEMORIA
@@ -25,8 +87,7 @@ MEMORIA_PATH = "data/eventos_enviados.json"
 def carregar_memoria() -> set:
     try:
         with open(MEMORIA_PATH, "r") as f:
-            data = json.load(f)
-            return set(data.get("enviados", []))
+            return set(json.load(f).get("enviados", []))
     except (FileNotFoundError, json.JSONDecodeError):
         return set()
 
@@ -48,29 +109,17 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "buscar_eventos_web",
-            "description": (
-                "Busca eventos em Joao Pessoa via Tavily. "
-                "Use queries CIRURGICAS e VARIADAS. Faca no minimo 20 buscas cobrindo:\n"
-                "PLATAFORMAS: sympla.com.br, eventbrite.com.br, even3.com.br, doity.com.br, ingresse.com, meetup.com\n"
-                "CATEGORIAS: tecnologia, IA, inteligencia artificial, programacao, startups, "
-                "marketing digital, growth hacking, redes sociais, empreendedorismo, negocios, "
-                "vendas, gestao, lideranca, odontologia, estetica, medicina, clinicas, fisioterapia, nutricao\n"
-                "EXEMPLOS de queries boas:\n"
-                "- 'eventos Joao Pessoa abril 2026 site:sympla.com.br'\n"
-                "- 'workshop inteligencia artificial Joao Pessoa 2026'\n"
-                "- 'congresso odontologia Paraiba 2026'\n"
-                "- 'meetup tecnologia Joao Pessoa site:meetup.com'\n"
-                "- 'curso marketing digital Joao Pessoa presencial 2026'\n"
-                "- 'evento estetica clinicas Joao Pessoa 2026'\n"
-                "- 'networking empreendedores Joao Pessoa 2026'\n"
-                "Varie as queries. Nao repita os mesmos termos."
-            ),
+            "description": "Busca eventos por cidade e categoria via Tavily.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Query de busca"}
+                    "query": {"type": "string"},
+                    "cidade": {
+                        "type": "string",
+                        "description": "Ex: joao_pessoa, campina_grande, recife, natal, fortaleza"
+                    }
                 },
-                "required": ["query"]
+                "required": ["query", "cidade"]
             }
         }
     },
@@ -78,15 +127,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "acessar_pagina_evento",
-            "description": (
-                "Acessa a pagina de um evento para extrair informacoes detalhadas: "
-                "preco exato, data completa, local com endereco, descricao completa. "
-                "Use quando os dados da busca estiverem incompletos, especialmente para preco."
-            ),
+            "description": "Acessa pagina do evento para extrair preco, data, local e informacoes sobre palestrantes/call for papers.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "url": {"type": "string", "description": "URL da pagina do evento"}
+                    "url": {"type": "string"}
                 },
                 "required": ["url"]
             }
@@ -96,13 +141,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "finalizar_e_enviar",
-            "description": (
-                "Finaliza a pesquisa e envia os eventos encontrados via WhatsApp. "
-                "Chame SOMENTE apos ter feito todas as buscas (minimo 20) e acessado "
-                "as paginas dos eventos para confirmar preco e detalhes. "
-                "IMPORTANTE: inclua APENAS eventos que acontecem em Joao Pessoa ou Paraiba. "
-                "Exclua eventos de outros estados."
-            ),
+            "description": "Finaliza e envia os eventos encontrados. So chame apos todas as buscas.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -111,18 +150,33 @@ TOOLS = [
                         "items": {
                             "type": "object",
                             "properties": {
-                                "nome":      {"type": "string"},
-                                "data":      {"type": "string", "description": "Ex: 28/04/2026 as 9h"},
-                                "local":     {"type": "string", "description": "Endereco completo ou Online"},
-                                "resumo":    {"type": "string", "description": "2-3 frases diretas sobre o evento"},
-                                "preco":     {"type": "string", "description": "Gratuito / R$ XX,00 / Sob consulta"},
-                                "url":       {"type": "string"},
+                                "nome":     {"type": "string"},
+                                "data":     {"type": "string"},
+                                "local":    {"type": "string"},
+                                "cidade":   {"type": "string", "description": "Ex: joao_pessoa, recife, natal..."},
+                                "resumo":   {"type": "string"},
+                                "preco":    {"type": "string"},
+                                "url":      {"type": "string"},
                                 "categoria": {
                                     "type": "string",
                                     "enum": ["tecnologia_ia", "marketing", "negocios_empreend", "saude_clinicas", "outros"]
+                                },
+                                "oportunidade_palestra": {
+                                    "type": "string",
+                                    "enum": ["alta", "media", "baixa", "nenhuma"],
+                                    "description": "Chance de Abel conseguir palestrar nesse evento"
+                                },
+                                "motivo_palestra": {
+                                    "type": "string",
+                                    "description": "Por que e uma boa ou nao oportunidade de palestra para Abel"
+                                },
+                                "score_evento": {
+                                    "type": "integer",
+                                    "description": "Score de 0-10 considerando tamanho, publico-alvo e networking"
                                 }
                             },
-                            "required": ["nome", "resumo", "url", "categoria"]
+                            "required": ["nome", "resumo", "url", "categoria", "cidade",
+                                        "oportunidade_palestra", "score_evento"]
                         }
                     }
                 },
@@ -137,7 +191,7 @@ TOOLS = [
 # EXECUTORES
 # --------------------------------------------------
 
-def buscar_eventos_web(query: str) -> str:
+def buscar_eventos_web(query: str, cidade: str = "joao_pessoa") -> str:
     try:
         api_key = os.environ.get("TAVILY_API_KEY")
         if not api_key:
@@ -174,25 +228,18 @@ def acessar_pagina_evento(url: str) -> str:
     try:
         headers = {"User-Agent": "Mozilla/5.0 (compatible; EventBot/1.0)"}
         r = httpx.get(url, headers=headers, timeout=15, follow_redirects=True)
-        texto = r.text
-
-        # Extrai texto relevante removendo HTML de forma simples
-        import re
-        texto = re.sub(r"<style[^>]*>.*?</style>", " ", texto, flags=re.DOTALL)
+        texto = re.sub(r"<style[^>]*>.*?</style>", " ", r.text, flags=re.DOTALL)
         texto = re.sub(r"<script[^>]*>.*?</script>", " ", texto, flags=re.DOTALL)
         texto = re.sub(r"<[^>]+>", " ", texto)
         texto = re.sub(r"\s+", " ", texto).strip()
-
-        # Retorna os primeiros 2000 chars que costumam ter as infos principais
-        return texto[:1000]
-
+        return texto[:1200]
     except Exception as e:
-        return f"Nao foi possivel acessar a pagina: {e}"
+        return f"Nao foi possivel acessar: {e}"
 
 
 def executar_tool(nome: str, args: dict) -> str:
     if nome == "buscar_eventos_web":
-        return buscar_eventos_web(args["query"])
+        return buscar_eventos_web(args["query"], args.get("cidade", "joao_pessoa"))
     if nome == "acessar_pagina_evento":
         return acessar_pagina_evento(args["url"])
     return "Tool nao encontrada."
@@ -209,25 +256,56 @@ def enviar_whatsapp(mensagem: str) -> bool:
     numero   = os.environ.get("WHATSAPP_NUMERO_DESTINO")
 
     if not all([base_url, api_key, instance, numero]):
-        print("WhatsApp nao configurado — salvo so em arquivo.")
+        print("WhatsApp nao configurado.")
         return False
 
-    try:
-        url = f"{base_url}/message/sendText/{instance}"
-        r = httpx.post(
-            url,
-            json={"number": numero, "text": mensagem},
-            headers={"apikey": api_key, "Content-Type": "application/json"},
-            timeout=15
-        )
-        if r.status_code in (200, 201):
-            print("WhatsApp enviado com sucesso!")
-            return True
-        print(f"Erro Evolution API: {r.status_code} — {r.text[:300]}")
-        return False
-    except Exception as e:
-        print(f"Erro ao enviar WhatsApp: {e}")
-        return False
+    # Divide mensagens longas (WhatsApp tem limite)
+    partes = dividir_mensagem(mensagem, limite=3500)
+
+    for i, parte in enumerate(partes):
+        try:
+            r = httpx.post(
+                f"{base_url}/message/sendText/{instance}",
+                json={"number": numero, "text": parte},
+                headers={"apikey": api_key, "Content-Type": "application/json"},
+                timeout=15
+            )
+            if r.status_code in (200, 201):
+                print(f"WhatsApp parte {i+1}/{len(partes)} enviada!")
+            else:
+                print(f"Erro Evolution API: {r.status_code} — {r.text[:300]}")
+                return False
+        except Exception as e:
+            print(f"Erro ao enviar WhatsApp: {e}")
+            return False
+        if len(partes) > 1:
+            import time
+            time.sleep(2)
+
+    return True
+
+
+def dividir_mensagem(texto: str, limite: int = 3500) -> list:
+    """Divide mensagem longa em partes menores."""
+    if len(texto) <= limite:
+        return [texto]
+
+    partes = []
+    linhas = texto.split("\n")
+    parte_atual = ""
+
+    for linha in linhas:
+        if len(parte_atual) + len(linha) + 1 > limite:
+            if parte_atual:
+                partes.append(parte_atual.strip())
+            parte_atual = linha + "\n"
+        else:
+            parte_atual += linha + "\n"
+
+    if parte_atual.strip():
+        partes.append(parte_atual.strip())
+
+    return partes
 
 
 # --------------------------------------------------
@@ -242,84 +320,139 @@ EMOJI_CAT = {
     "outros":            "📌",
 }
 
+EMOJI_PALESTRA = {
+    "alta":   "🎤⭐",
+    "media":  "🎤",
+    "baixa":  "👀",
+    "nenhuma": "",
+}
+
+EMOJI_CIDADE = {
+    "joao_pessoa":    "🏙️ JP",
+    "campina_grande": "🏔️ CG",
+    "recife":         "🌊 Recife",
+    "natal":          "☀️ Natal",
+    "fortaleza":      "🦞 Fortaleza",
+}
+
+
 def formatar_mensagem(eventos_novos: list, total: int) -> str:
     hoje = datetime.now().strftime("%d/%m/%Y")
 
     if not eventos_novos:
         return (
-            f"📅 *Eventos JP — {hoje}*\n\n"
-            "Nenhum evento novo encontrado hoje.\n"
-            "Todos os eventos conhecidos ja foram enviados! 👍"
+            f"📅 *Eventos — {hoje}*\n\n"
+            "Nenhum evento novo hoje. Todos ja foram enviados! 👍"
         )
 
-    linhas = [f"📅 *Eventos JP — {hoje}*"]
-    linhas.append(f"_{len(eventos_novos)} novos de {total} encontrados_\n")
+    # Separa por cidade e ordena por score
+    jp = sorted([e for e in eventos_novos if e.get("cidade") == "joao_pessoa"],
+                key=lambda x: x.get("score_evento", 0), reverse=True)
+    fora = sorted([e for e in eventos_novos if e.get("cidade") != "joao_pessoa"],
+                  key=lambda x: x.get("score_evento", 0), reverse=True)
 
-    for ev in eventos_novos:
-        emoji = EMOJI_CAT.get(ev.get("categoria", "outros"), "📌")
-        linhas.append(f"{emoji} *{ev.get('nome', '')}*")
+    # Separa oportunidades de palestra
+    palestras = [e for e in eventos_novos if e.get("oportunidade_palestra") in ("alta", "media")]
 
-        data  = ev.get("data", "")
-        local = ev.get("local", "")
-        preco = ev.get("preco", "A confirmar")
-        url   = ev.get("url", "")
+    linhas = [f"📅 *Agenda de Eventos — {hoje}*"]
+    linhas.append(f"_{len(eventos_novos)} novos | {len(palestras)} oportunidades de palestra_\n")
 
-        if data:  linhas.append(f"📆 {data}")
-        if local: linhas.append(f"📍 {local}")
-        linhas.append(f"💬 {ev.get('resumo', '')}")
-        linhas.append(f"💰 {preco}")
-        if url: linhas.append(f"🔗 {url}")
-        linhas.append("")
+    # Oportunidades de palestra em destaque
+    if palestras:
+        linhas.append("🎤 *OPORTUNIDADES PARA PALESTRAR*")
+        linhas.append("─────────────────────")
+        for ev in palestras:
+            emoji_p = EMOJI_PALESTRA.get(ev.get("oportunidade_palestra", ""), "")
+            linhas.append(f"{emoji_p} *{ev.get('nome', '')}*")
+            linhas.append(f"📍 {ev.get('local', '')} | {EMOJI_CIDADE.get(ev.get('cidade', ''), '')}")
+            if ev.get("data"): linhas.append(f"📆 {ev.get('data')}")
+            linhas.append(f"💡 {ev.get('motivo_palestra', '')}")
+            linhas.append(f"🔗 {ev.get('url', '')}")
+            linhas.append("")
 
-    linhas.append("_Agente de Eventos JP 🤖_")
+    # Eventos de JP
+    if jp:
+        linhas.append("🏙️ *JOAO PESSOA*")
+        linhas.append("─────────────────────")
+        for ev in jp:
+            _adicionar_evento(linhas, ev)
+
+    # Eventos de outras cidades
+    if fora:
+        linhas.append("✈️ *VALE A VIAGEM*")
+        linhas.append("─────────────────────")
+        for ev in fora:
+            cidade_label = EMOJI_CIDADE.get(ev.get("cidade", ""), ev.get("cidade", ""))
+            linhas.append(f"📍 *{cidade_label}*")
+            _adicionar_evento(linhas, ev)
+
+    linhas.append("_Agente de Eventos 🤖_")
     return "\n".join(linhas)
+
+
+def _adicionar_evento(linhas: list, ev: dict):
+    emoji = EMOJI_CAT.get(ev.get("categoria", "outros"), "📌")
+    score = ev.get("score_evento", 0)
+    estrelas = "⭐" * min(score // 3, 3) if score >= 7 else ""
+
+    linhas.append(f"{emoji} *{ev.get('nome', '')}* {estrelas}")
+    if ev.get("data"):  linhas.append(f"📆 {ev.get('data')}")
+    if ev.get("local"): linhas.append(f"📍 {ev.get('local')}")
+    linhas.append(f"💬 {ev.get('resumo', '')}")
+    linhas.append(f"💰 {ev.get('preco', 'A confirmar')}")
+    if ev.get("url"):   linhas.append(f"🔗 {ev.get('url')}")
+    linhas.append("")
 
 
 # --------------------------------------------------
 # SYSTEM PROMPT
 # --------------------------------------------------
 
-SYSTEM_PROMPT = """Voce e um agente especializado em descobrir eventos em Joao Pessoa, PB, Brasil.
+SYSTEM_PROMPT = f"""Voce e um agente especializado em descobrir eventos relevantes para Abel,
+dono de uma agencia de IA no Nordeste do Brasil.
 
-REGRAS ABSOLUTAS:
-1. Inclua APENAS eventos em Joao Pessoa ou Paraiba. Descarte eventos de outros estados.
-2. Inclua APENAS eventos futuros. Descarte eventos com data anterior a hoje.
-3. Faca NO MINIMO 25 buscas antes de finalizar. Seja exaustivo e varie as queries.
-4. Acesse a pagina de cada evento para confirmar preco real. Evite "Sob consulta".
+PERFIL DO ABEL:
+{PERFIL}
 
-CATEGORIAS — cubra TODAS:
-- Tecnologia, IA, inteligencia artificial, machine learning, inovacao, startups, programacao
-- Marketing digital, growth, redes sociais, trafego pago, copywriting, criacao de conteudo
-- Empreendedorismo, negocios, vendas, gestao, financas, lideranca, RH
-- Saude: odontologia, medicina estetica, fisioterapia, nutricao, enfermagem, gestao de clinicas
+MISSAO:
+1. Encontrar eventos relevantes em JP e cidades proximas
+2. Avaliar cada evento como oportunidade de palestra para Abel
+3. Classificar eventos de fora de JP apenas se valerem a viagem
 
-PLATAFORMAS — faca buscas especificas em CADA UMA:
-- site:sympla.com.br
-- site:even3.com.br
-- site:doity.com.br
-- site:eventbrite.com.br
-- site:meetup.com
-- site:ingresse.com
+CIDADES E CRITERIOS:
+- Joao Pessoa/PB: todos os eventos relevantes (tecnologia, IA, negocios, saude, marketing)
+- Campina Grande/PB (130km): eventos de tech, inovacao e negocios com boa estrutura
+- Recife/PE (120km): apenas conferencias e summits de grande porte (+200 pessoas)
+- Natal/RN (185km): apenas eventos grandes OU com clara oportunidade de palestra
+- Fortaleza/CE (500km): apenas eventos excepcionais — grandes conferencias nacionais
 
-ENTIDADES LOCAIS — busque eventos organizados por:
-- SEBRAE Paraiba: "evento SEBRAE Joao Pessoa 2026"
-- ACIPB (Associacao Comercial): "evento ACIPB Joao Pessoa 2026"
-- Startup PB / ecossistema de inovacao: "startup PB evento 2026"
-- CRO-PB (odontologia): "evento CRO Paraiba 2026"
-- CRM-PB (medicina): "evento CRM Paraiba 2026"
-- UFPB / UEPB / Uninassau / IESP: "evento workshop UFPB 2026"
-- SENAC PB: "curso evento SENAC Joao Pessoa 2026"
-- CDL Joao Pessoa: "evento CDL Joao Pessoa 2026"
+ANALISE DE OPORTUNIDADE DE PALESTRA:
+Para cada evento, avalie se Abel pode palestrar considerando:
+- O evento aceita propostas de palestra? (call for papers, call for speakers)
+- O publico e o mesmo que Abel atende? (empreendedores, clinicas, tech)
+- O tema de Abel (IA aplicada a negocios) se encaixa na programacao?
+- E um evento de networking onde Abel pode se apresentar como especialista?
 
-ESTRATEGIA DE BUSCA — varie sempre:
-- Por mes: "eventos Joao Pessoa maio 2026", "eventos JP junho 2026"
-- Por nicho: "congresso odontologia Paraiba 2026", "summit marketing JP 2026"
-- Por formato: "workshop presencial Joao Pessoa 2026", "meetup tech JP 2026"
-- Por publico: "evento donos de clinica Paraiba", "gestor saude evento JP"
-- Geral: "agenda eventos Joao Pessoa 2026", "o que fazer JP abril 2026"
+Classifique:
+- ALTA: evento claramente alinhado, aceita palestrantes externos, publico ideal
+- MEDIA: evento relevante, possibilidade de networking ou abordagem futura
+- BAIXA: evento de networking mas publico parcialmente alinhado
+- NENHUMA: evento tecnico fechado ou publico nao relacionado
 
-Apos todas as buscas, acesse as paginas dos eventos encontrados para confirmar preco e data.
-So entao chame finalizar_e_enviar."""
+BUSCA — faca no minimo 30 buscas:
+PLATAFORMAS: site:sympla.com.br, site:even3.com.br, site:doity.com.br, site:eventbrite.com.br, site:meetup.com
+ENTIDADES JP: SEBRAE PB, ACIPB, Startup PB, CRO-PB, CRM-PB, UFPB, SENAC, CDL JP
+ENTIDADES RECIFE: Porto Digital, SEBRAE PE, ACPE, eventos Recife Criativo
+ENTIDADES NATAL: SEBRAE RN, eventos tecnologia Natal
+CATEGORIAS: tecnologia, IA, marketing, empreendedorismo, negocios, saude, clinicas, odontologia, estetica
+
+REGRAS:
+1. APENAS eventos futuros — descarte passados
+2. Para eventos fora de JP, acesse a pagina para confirmar porte e relevancia
+3. Busque informacoes sobre como se tornar palestrante em cada evento
+4. Score 0-10 considerando: tamanho do evento, alinhamento com perfil de Abel, qualidade do networking
+
+So chame finalizar_e_enviar apos completar TODAS as buscas."""
 
 
 # --------------------------------------------------
@@ -329,7 +462,7 @@ So entao chame finalizar_e_enviar."""
 def rodar_agente():
     hoje = datetime.now().strftime("%d/%m/%Y")
     print("=" * 50)
-    print(f"Agente de Eventos JP — {hoje}")
+    print(f"Agente de Eventos — {hoje}")
     print("=" * 50)
 
     memoria = carregar_memoria()
@@ -338,22 +471,22 @@ def rodar_agente():
     mensagens = [{
         "role": "user",
         "content": (
-            f"Hoje e {hoje}. Busque TODOS os eventos em Joao Pessoa, PB "
-            f"para os proximos 90 dias. "
-            f"Faca no minimo 25 buscas cobrindo todas as categorias, plataformas e entidades locais. "
-            f"Acesse as paginas dos eventos para confirmar preco real e data exata. "
-            f"DESCARTE eventos com data anterior a hoje ({hoje}). "
-            f"DESCARTE eventos fora de JP ou Paraiba."
+            f"Hoje e {hoje}. Busque eventos para os proximos 90 dias em "
+            f"Joao Pessoa, Campina Grande, Recife, Natal e Fortaleza. "
+            f"Para JP busque tudo. Para outras cidades aplique o criterio de qualidade. "
+            f"Analise cada evento como oportunidade de palestra para Abel. "
+            f"Faca no minimo 30 buscas. Acesse paginas dos eventos para confirmar detalhes. "
+            f"DESCARTE eventos com data anterior a hoje ({hoje})."
         )
     }]
 
     iteracoes = 0
 
-    while iteracoes < 30:
+    while iteracoes < 40:
         iteracoes += 1
 
         resposta = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=MODELO,
             messages=[{"role": "system", "content": SYSTEM_PROMPT}] + mensagens,
             tools=TOOLS,
             tool_choice="auto",
@@ -364,7 +497,7 @@ def rodar_agente():
         mensagens.append(msg)
 
         if not msg.tool_calls:
-            print("Agente finalizou sem chamar ferramentas.")
+            print("Agente finalizou.")
             break
 
         for tc in msg.tool_calls:
@@ -375,41 +508,41 @@ def rodar_agente():
                 eventos = args.get("eventos", [])
                 print(f"\nTotal encontrado: {len(eventos)} eventos")
 
-                # Filtra eventos passados (garante no codigo, nao so no prompt)
+                # Filtra eventos passados
                 hoje_dt = datetime.now().date()
-                eventos_futuros = []
+                futuros = []
                 for ev in eventos:
                     data_str = ev.get("data", "")
-                    eh_futuro = True  # se nao tem data, inclui por precaucao
+                    futuro = True
                     if data_str:
-                        # tenta extrair ano/mes/dia do texto da data
-                        import re
                         match = re.search(r"(\d{2})/(\d{2})/(\d{4})", data_str)
                         if match:
                             try:
                                 from datetime import date
-                                dia, mes, ano = int(match.group(1)), int(match.group(2)), int(match.group(3))
-                                data_ev = date(ano, mes, dia)
-                                eh_futuro = data_ev >= hoje_dt
+                                d = date(int(match.group(3)), int(match.group(2)), int(match.group(1)))
+                                futuro = d >= hoje_dt
                             except Exception:
                                 pass
-                    if eh_futuro:
-                        eventos_futuros.append(ev)
+                    if futuro:
+                        futuros.append(ev)
                     else:
-                        print(f"Descartado (passado): {ev.get('nome', '')} — {data_str}")
+                        print(f"Descartado (passado): {ev.get('nome')} — {data_str}")
 
-                print(f"Eventos futuros: {len(eventos_futuros)} de {len(eventos)}")
+                print(f"Futuros: {len(futuros)}")
 
                 # Filtra ja enviados
                 novos = []
-                for ev in eventos_futuros:
-                    url = ev.get("url", "") or ev.get("nome", "")
-                    ev_id = gerar_id_evento(url)
+                for ev in futuros:
+                    ev_id = gerar_id_evento(ev.get("url", "") or ev.get("nome", ""))
                     if ev_id not in memoria:
                         ev["_id"] = ev_id
                         novos.append(ev)
 
-                print(f"Eventos novos: {len(novos)}")
+                print(f"Novos: {len(novos)}")
+
+                # Conta oportunidades de palestra
+                palestras = [e for e in novos if e.get("oportunidade_palestra") in ("alta", "media")]
+                print(f"Oportunidades de palestra: {len(palestras)}")
 
                 mensagem = formatar_mensagem(novos, len(eventos))
 
@@ -417,22 +550,20 @@ def rodar_agente():
                 caminho = f"relatorio_{datetime.now().strftime('%Y-%m-%d')}.txt"
                 with open(caminho, "w", encoding="utf-8") as f:
                     f.write(mensagem)
-                print(f"Salvo em: {caminho}")
-                print(mensagem[:1000])
+                print(f"Salvo: {caminho}")
+                print(mensagem[:800])
 
-                # Envia WhatsApp
                 enviar_whatsapp(mensagem)
 
-                # Atualiza memoria
                 for ev in novos:
                     memoria.add(ev["_id"])
                 salvar_memoria(memoria)
-                print(f"Memoria atualizada: {len(memoria)} eventos registrados")
+                print(f"Memoria: {len(memoria)} eventos registrados")
 
                 mensagens.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
-                    "content": f"Enviado. {len(novos)} novos de {len(eventos)}."
+                    "content": f"Enviado. {len(novos)} novos, {len(palestras)} oportunidades de palestra."
                 })
                 return
 
