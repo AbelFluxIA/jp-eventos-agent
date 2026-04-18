@@ -19,17 +19,40 @@ from openai import OpenAI
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 OPENAI_API_KEY     = os.environ.get("OPENAI_API_KEY")
 
+# Modelos em ordem de preferencia (tenta cada um se der rate limit)
+# Gratuitos primeiro, pagos como garantia no final
+MODELOS_FALLBACK = [
+    os.environ.get("MODELO_IA", "qwen/qwen3-coder:free"),
+    "qwen/qwen3.6-plus:free",
+    "minimax/minimax-m2.5:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "gpt-4o-mini",   # fallback pago — so usa se todos gratuitos falharem
+]
+
 if OPENROUTER_API_KEY:
-    client = OpenAI(
+    client_openrouter = OpenAI(
         api_key=OPENROUTER_API_KEY,
         base_url="https://openrouter.ai/api/v1",
     )
-    MODELO = os.environ.get("MODELO_IA", "qwen/qwen3.6-plus:free")
-    print(f"Usando OpenRouter: {MODELO}")
 else:
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    MODELO = "gpt-4o-mini"
-    print("Usando OpenAI: gpt-4o-mini")
+    client_openrouter = None
+
+client_openai = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+MODELO = MODELOS_FALLBACK[0]
+print(f"Modelo inicial: {MODELO}")
+
+
+def get_client_para_modelo(modelo: str):
+    """Retorna o client correto dependendo do modelo."""
+    modelos_openai = ["gpt-4o-mini", "gpt-4o", "gpt-4-turbo"]
+    if any(m in modelo for m in modelos_openai):
+        if not client_openai:
+            raise ValueError("OPENAI_API_KEY nao configurada")
+        return client_openai
+    if not client_openrouter:
+        raise ValueError("OPENROUTER_API_KEY nao configurada")
+    return client_openrouter
 
 MEMORIA_PATH = "data/eventos_enviados.json"
 
@@ -482,16 +505,36 @@ def rodar_agente():
 
     iteracoes = 0
 
+    modelo_atual = MODELO
+    indice_modelo = 0
+
     while iteracoes < 40:
         iteracoes += 1
 
-        resposta = client.chat.completions.create(
-            model=MODELO,
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + mensagens,
-            tools=TOOLS,
-            tool_choice="auto",
-            temperature=0.1,
-        )
+        try:
+            client_atual = get_client_para_modelo(modelo_atual)
+            resposta = client_atual.chat.completions.create(
+                model=modelo_atual,
+                messages=[{"role": "system", "content": SYSTEM_PROMPT}] + mensagens,
+                tools=TOOLS,
+                tool_choice="auto",
+                temperature=0.1,
+            )
+        except Exception as e:
+            erro = str(e)
+            if "429" in erro or "rate" in erro.lower() or "Rate" in erro or "upstream" in erro.lower():
+                indice_modelo += 1
+                if indice_modelo < len(MODELOS_FALLBACK):
+                    modelo_atual = MODELOS_FALLBACK[indice_modelo]
+                    print(f"Rate limit! Trocando para: {modelo_atual}")
+                    import time
+                    time.sleep(5)
+                    continue
+                else:
+                    print("ERRO CRITICO: todos os modelos falharam.")
+                    enviar_whatsapp("⚠️ Agente de Eventos: todos os modelos de IA estao com rate limit. Tente rodar novamente mais tarde.")
+                    return
+            raise
 
         msg = resposta.choices[0].message
         mensagens.append(msg)
