@@ -227,7 +227,7 @@ def buscar_eventos_web(query: str, cidade: str = "joao_pessoa") -> str:
                 "api_key": api_key,
                 "query": query,
                 "search_depth": "basic",
-                "max_results": 5,
+                "max_results": 4,
             },
             timeout=20
         )
@@ -240,7 +240,7 @@ def buscar_eventos_web(query: str, cidade: str = "joao_pessoa") -> str:
             saida.append(
                 f"Titulo: {res.get('title', '')}\n"
                 f"URL: {res.get('url', '')}\n"
-                f"Conteudo: {res.get('content', '')[:250]}\n"
+                f"Conteudo: {res.get('content', '')[:120]}\n"
             )
         return "\n---\n".join(saida)
 
@@ -256,7 +256,7 @@ def acessar_pagina_evento(url: str) -> str:
         texto = re.sub(r"<script[^>]*>.*?</script>", " ", texto, flags=re.DOTALL)
         texto = re.sub(r"<[^>]+>", " ", texto)
         texto = re.sub(r"\s+", " ", texto).strip()
-        return texto[:1200]
+        return texto[:600]
     except Exception as e:
         return f"Nao foi possivel acessar: {e}"
 
@@ -512,6 +512,13 @@ def rodar_agente():
     while iteracoes < 40:
         iteracoes += 1
 
+        # Limpa historico se ficar muito grande (evita context length exceeded)
+        # Mantem: primeira mensagem do user + ultimas 8 trocas
+        if len(mensagens) > 18:
+            primeira = mensagens[0]
+            mensagens = [primeira] + mensagens[-16:]
+            print(f"Historico podado para {len(mensagens)} mensagens")
+
         try:
             client_atual = get_client_para_modelo(modelo_atual)
             resposta = client_atual.chat.completions.create(
@@ -523,7 +530,9 @@ def rodar_agente():
             )
         except Exception as e:
             erro = str(e)
-            if any(x in erro for x in ["429", "404", "rate", "Rate", "upstream", "deprecated", "not found", "NotFound"]):
+            if any(x in erro for x in ["400", "context_length", "maximum context", "too long",
+                                            "429", "404", "rate", "Rate", "upstream", "deprecated",
+                                            "not found", "NotFound"]):
                 indice_modelo += 1
                 if indice_modelo < len(MODELOS_FALLBACK):
                     modelo_atual = MODELOS_FALLBACK[indice_modelo]
