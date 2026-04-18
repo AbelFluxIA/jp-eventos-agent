@@ -19,14 +19,15 @@ from openai import OpenAI
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 OPENAI_API_KEY     = os.environ.get("OPENAI_API_KEY")
 
-# Modelos em ordem de preferencia (tenta cada um se der rate limit)
-# Gratuitos primeiro, pagos como garantia no final
+# Modelos em ordem de preferencia
+# Gratuitos primeiro, gpt-4o-mini como garantia final
 MODELOS_FALLBACK = [
     os.environ.get("MODELO_IA", "qwen/qwen3-coder:free"),
-    "qwen/qwen3.6-plus:free",
     "minimax/minimax-m2.5:free",
     "meta-llama/llama-3.3-70b-instruct:free",
-    "gpt-4o-mini",   # fallback pago — so usa se todos gratuitos falharem
+    "mistralai/mistral-small-3.1-24b-instruct:free",
+    "nvidia/llama-3.1-nemotron-ultra-253b-v1:free",
+    "gpt-4o-mini",   # pago — garantia final
 ]
 
 if OPENROUTER_API_KEY:
@@ -522,7 +523,7 @@ def rodar_agente():
             )
         except Exception as e:
             erro = str(e)
-            if "429" in erro or "rate" in erro.lower() or "Rate" in erro or "upstream" in erro.lower():
+            if any(x in erro for x in ["429", "404", "rate", "Rate", "upstream", "deprecated", "not found", "NotFound"]):
                 indice_modelo += 1
                 if indice_modelo < len(MODELOS_FALLBACK):
                     modelo_atual = MODELOS_FALLBACK[indice_modelo]
