@@ -1,497 +1,515 @@
 """
-Agente de Eventos — Joao Pessoa + Cidades do Nordeste
-- Sem repeticao de eventos (memoria persistente)
-- Sem eventos passados (filtro por data no codigo)
-- Alerta para eventos proximos (menos de 7 dias)
-- Todas as cidades tratadas igual JP
-- Fallback entre 3 chaves Tavily com alerta WhatsApp
+painel.py
+Painel web para visualizar eventos encontrados pelo agente.
+Acesse: http://SEU-IP:10000/painel
 """
 
-import os, json, hashlib, httpx, re, time
-from datetime import datetime, date, timedelta
-from openai import OpenAI
+import os
+import json
+from datetime import datetime
 
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-MODELO = os.environ.get("MODELO_IA", "gpt-4o-mini")
 MEMORIA_PATH = "data/eventos_enviados.json"
-
-PERFIL = """
-Abel — dono da FluxIA (agencia de IA no Nordeste)
-Cria: agentes de atendimento, sistemas SaaS, APIs, automacoes para clinicas
-Quer: palestrar, networking, vender IA para clinicas e empresas
-Publico-alvo: donos de clinicas, empreendedores, profissionais de saude
-Tema: IA aplicada a negocios, automacao, agentes de atendimento
-"""
-
-# Cidades — todas tratadas com mesma prioridade
-CIDADES = [
-    "Joao Pessoa PB",
-    "Campina Grande PB",
-    "Recife PE",
-    "Natal RN",
-    "Fortaleza CE",
-    "Maceio AL",
-]
-
-QUERIES_EVENTOS = []
-for cidade in CIDADES:
-    QUERIES_EVENTOS += [
-        f"eventos {cidade} 2026 site:sympla.com.br",
-        f"eventos {cidade} 2026 site:even3.com.br",
-        f"evento tecnologia IA {cidade} 2026",
-        f"evento empreendedorismo negocios {cidade} 2026",
-        f"congresso saude clinicas {cidade} 2026",
-        f"evento marketing digital {cidade} 2026",
-    ]
-
-# Queries extras para JP (cidade principal)
-QUERIES_EVENTOS += [
-    "eventos Joao Pessoa 2026 site:doity.com.br",
-    "eventos Joao Pessoa 2026 site:eventbrite.com.br",
-    "evento SEBRAE Paraiba 2026",
-    "evento CRO CRM Paraiba 2026",
-    "startup PB inovacao evento 2026",
-    "evento SENAC ACIPB CDL Joao Pessoa 2026",
-]
+RELATORIOS_DIR = "."
 
 
-# --------------------------------------------------
-# MEMORIA
-# --------------------------------------------------
-
-def carregar_memoria() -> set:
+def carregar_eventos_memoria() -> list:
+    """Carrega IDs dos eventos enviados."""
     try:
         with open(MEMORIA_PATH, "r") as f:
-            return set(json.load(f).get("enviados", []))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return set()
-
-def salvar_memoria(enviados: set):
-    os.makedirs("data", exist_ok=True)
-    with open(MEMORIA_PATH, "w") as f:
-        json.dump({"enviados": list(enviados)}, f, indent=2)
-
-def gerar_id(texto: str) -> str:
-    return hashlib.md5(texto.encode()).hexdigest()[:12]
-
-
-# --------------------------------------------------
-# TAVILY — fallback entre multiplas chaves
-# --------------------------------------------------
-
-def _get_tavily_keys() -> list:
-    chaves = []
-    for var in ["TAVILY_API_KEY", "TAVILY_API_KEY_2", "TAVILY_API_KEY_3"]:
-        k = os.environ.get(var)
-        if k:
-            chaves.append(k)
-    return chaves
-
-def _alertar_admin(msg: str):
-    base = os.environ.get("EVOLUTION_API_URL","").rstrip("/manager").rstrip("/")
-    key  = os.environ.get("EVOLUTION_API_KEY","")
-    inst = os.environ.get("EVOLUTION_INSTANCE","")
-    num  = os.environ.get("WHATSAPP_ADMIN", os.environ.get("WHATSAPP_NUMERO_DESTINO",""))
-    if not all([base, key, inst, num]):
-        return
-    try:
-        httpx.post(f"{base}/message/sendText/{inst}",
-            json={"number": num, "text": f"🚨 ALERTA AGENTE: {msg}"},
-            headers={"apikey": key, "Content-Type": "application/json"}, timeout=10)
+            return json.load(f).get("enviados", [])
     except Exception:
-        pass
-
-def buscar_tavily(query: str, max_results: int = 5) -> list:
-    chaves = _get_tavily_keys()
-    if not chaves:
-        print("  Nenhuma TAVILY_API_KEY configurada")
         return []
 
-    for i, api_key in enumerate(chaves):
-        try:
-            r = httpx.post(
-                "https://api.tavily.com/search",
-                json={"api_key": api_key, "query": query,
-                      "search_depth": "basic", "max_results": max_results},
-                timeout=15
-            )
-            data = r.json()
-            if r.status_code == 429 or "quota" in str(data).lower() or "limit" in str(data).lower():
-                print(f"  Chave Tavily {i+1} com limite — tentando proxima...")
-                if i == len(chaves) - 1:
-                    _alertar_admin(
-                        "Todas as chaves Tavily atingiram o limite! "
-                        "Agente de eventos sem busca. Renove os creditos em tavily.com"
-                    )
-                continue
-            return data.get("results", [])
-        except Exception as e:
-            print(f"  Erro Tavily chave {i+1}: {e}")
-            continue
-    return []
 
-
-# --------------------------------------------------
-# FILTRO DE DATA — robusto, no codigo (nao so no prompt)
-# --------------------------------------------------
-
-def extrair_data(texto: str):
-    """Tenta extrair data do texto. Retorna objeto date ou None."""
-    if not texto:
-        return None
-    # Formato DD/MM/AAAA
-    m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", texto)
-    if m:
-        try:
-            return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
-        except ValueError:
-            pass
-    # Formato AAAA-MM-DD
-    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", texto)
-    if m:
-        try:
-            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        except ValueError:
-            pass
-    return None
-
-def filtrar_eventos_validos(eventos: list, hoje: date) -> tuple:
-    """
-    Retorna (futuros, proximos_7_dias, passados)
-    proximos_7_dias = eventos nos proximos 7 dias (alerta urgente)
-    """
-    futuros = []
-    proximos = []
-    passados = []
-
-    for ev in eventos:
-        data_ev = extrair_data(ev.get("data", ""))
-
-        if data_ev is None:
-            # Sem data definida — inclui mas sem alerta
-            futuros.append(ev)
-            continue
-
-        if data_ev < hoje:
-            passados.append(ev)
-            print(f"  Descartado (passado): {ev.get('nome','')} — {ev.get('data','')}")
-        else:
-            futuros.append(ev)
-            # Verifica se e nos proximos 7 dias
-            if data_ev <= hoje + timedelta(days=7):
-                proximos.append(ev)
-
-    return futuros, proximos, passados
-
-
-# --------------------------------------------------
-# WHATSAPP
-# --------------------------------------------------
-
-def enviar_whatsapp(mensagem: str) -> bool:
-    base_url = os.environ.get("EVOLUTION_API_URL","").rstrip("/manager").rstrip("/")
-    api_key  = os.environ.get("EVOLUTION_API_KEY")
-    instance = os.environ.get("EVOLUTION_INSTANCE")
-    numero   = os.environ.get("WHATSAPP_NUMERO_DESTINO")
-
-    if not all([base_url, api_key, instance, numero]):
-        print("WhatsApp nao configurado.")
-        return False
-
-    partes = _dividir_mensagem(mensagem)
-    for i, parte in enumerate(partes):
-        try:
-            r = httpx.post(
-                f"{base_url}/message/sendText/{instance}",
-                json={"number": numero, "text": parte},
-                headers={"apikey": api_key, "Content-Type": "application/json"},
-                timeout=15
-            )
-            if r.status_code in (200, 201):
-                print(f"WhatsApp {i+1}/{len(partes)} enviado!")
-            else:
-                print(f"Erro Evolution: {r.status_code} — {r.text[:200]}")
-                return False
-        except Exception as e:
-            print(f"Erro WhatsApp: {e}")
-            return False
-        if len(partes) > 1:
-            time.sleep(2)
-    return True
-
-def _dividir_mensagem(texto: str, limite: int = 3500) -> list:
-    if len(texto) <= limite:
-        return [texto]
-    partes = []
-    linhas = texto.split("\n")
-    parte_atual = ""
-    for linha in linhas:
-        if len(parte_atual) + len(linha) + 1 > limite:
-            if parte_atual:
-                partes.append(parte_atual.strip())
-            parte_atual = linha + "\n"
-        else:
-            parte_atual += linha + "\n"
-    if parte_atual.strip():
-        partes.append(parte_atual.strip())
-    return partes
-
-
-# --------------------------------------------------
-# FASE 1 — BUSCA
-# --------------------------------------------------
-
-def buscar_todos_eventos() -> list:
-    print(f"Fazendo {len(QUERIES_EVENTOS)} buscas...")
-    todos = []
-    for i, query in enumerate(QUERIES_EVENTOS):
-        print(f"  [{i+1}/{len(QUERIES_EVENTOS)}] {query[:65]}")
-        resultados = buscar_tavily(query, max_results=5)
-        for res in resultados:
-            todos.append({
-                "titulo": res.get("title","")[:100],
-                "url":    res.get("url",""),
-                "resumo": res.get("content","")[:180],
-            })
-        time.sleep(0.3)
-    print(f"Total bruto: {len(todos)} resultados")
-    return todos
-
-
-# --------------------------------------------------
-# FASE 2 — EXTRAIR EVENTOS COM IA
-# --------------------------------------------------
-
-SYSTEM_EXTRAIR = f"""Voce e um agente que extrai eventos de resultados de busca.
-
-PERFIL DE QUEM VAI RECEBER:
-{PERFIL}
-
-REGRAS:
-1. Extraia APENAS eventos com data futura confirmada ou provavelmente futura
-2. Inclua eventos de: Joao Pessoa, Campina Grande, Recife, Natal, Fortaleza, Maceio
-3. Descarte noticias, cursos online permanentes, resultados sem data
-4. Inclua todos os tipos relevantes: tech, IA, marketing, negocios, saude, clinicas
-5. Para palestra: avalie se Abel pode palestrar (alta/media/baixa/nenhuma)
-6. Para negocio: avalie se e oportunidade de venda de IA
-
-Retorne APENAS JSON valido sem markdown:
-[
-  {{
-    "nome": "nome completo",
-    "data": "DD/MM/AAAA ou vazio",
-    "local": "local ou Online",
-    "cidade": "nome da cidade",
-    "resumo": "2 frases diretas",
-    "preco": "Gratuito|R$ valor|A confirmar",
-    "url": "url exata",
-    "categoria": "tecnologia_ia|marketing|negocios_empreend|saude_clinicas|outros",
-    "palestra": "alta|media|baixa|nenhuma",
-    "motivo_palestra": "por que e ou nao oportunidade",
-    "negocio": "alto|medio|baixo",
-    "motivo_negocio": "quem estara e por que Abel pode vender"
-  }}
-]"""
-
-def extrair_eventos(resultados_brutos: list, hoje: str) -> list:
-    if not resultados_brutos:
-        return []
-
-    contexto = "\n".join([
-        f"- {r['titulo']} | {r['url']} | {r['resumo'][:120]}"
-        for r in resultados_brutos[:80]
-    ])
-
-    prompt = f"Hoje e {hoje}. Extraia eventos futuros relevantes desses resultados:\n\n{contexto}"
-
+def carregar_ultimo_relatorio() -> str:
+    """Carrega o conteudo do relatorio mais recente."""
     try:
-        r = client.chat.completions.create(
-            model=MODELO,
-            messages=[
-                {"role": "system", "content": SYSTEM_EXTRAIR},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.1,
-            max_tokens=3000,
-        )
-        resposta = r.choices[0].message.content.strip()
-        resposta = re.sub(r"```json|```", "", resposta).strip()
-        match = re.search(r"\[.*\]", resposta, re.DOTALL)
-        if match:
-            return json.loads(match.group())
-        return json.loads(resposta)
-    except Exception as e:
-        print(f"Erro ao extrair eventos: {e}")
-        return []
+        arquivos = sorted([
+            f for f in os.listdir(RELATORIOS_DIR)
+            if f.startswith("relatorio_") and f.endswith(".txt")
+        ], reverse=True)
+        if not arquivos:
+            return ""
+        with open(os.path.join(RELATORIOS_DIR, arquivos[0]), "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
 
 
-# --------------------------------------------------
-# FORMATAR MENSAGEM
-# --------------------------------------------------
+def gerar_html_painel(ultimo_relatorio: str, total_enviados: int,
+                      status_agente: dict) -> str:
+    """Gera HTML completo do painel."""
 
-EMOJI_CAT = {
-    "tecnologia_ia":     "🤖",
-    "marketing":         "📣",
-    "negocios_empreend": "💼",
-    "saude_clinicas":    "🏥",
-    "outros":            "📌",
-}
+    # Converte texto do relatorio para HTML
+    linhas_html = []
+    if ultimo_relatorio:
+        for linha in ultimo_relatorio.split("\n"):
+            linha = linha.strip()
+            if not linha:
+                linhas_html.append('<div class="spacer"></div>')
+            elif linha.startswith("📅"):
+                linhas_html.append(f'<div class="rel-titulo">{linha}</div>')
+            elif linha.startswith("⚡"):
+                linhas_html.append(f'<div class="rel-secao urgente">{linha}</div>')
+            elif linha.startswith("🎤"):
+                linhas_html.append(f'<div class="rel-secao palestra">{linha}</div>')
+            elif linha.startswith("💼"):
+                linhas_html.append(f'<div class="rel-secao negocio">{linha}</div>')
+            elif linha.startswith("📋"):
+                linhas_html.append(f'<div class="rel-secao outros">{linha}</div>')
+            elif linha.startswith("─"):
+                linhas_html.append('<hr class="rel-divider">')
+            elif linha.startswith("🔗"):
+                url = linha.replace("🔗 ", "")
+                linhas_html.append(
+                    f'<div class="rel-link">🔗 <a href="{url}" target="_blank">{url}</a></div>'
+                )
+            elif linha.startswith("📆") or linha.startswith("📍"):
+                linhas_html.append(f'<div class="rel-meta">{linha}</div>')
+            elif linha.startswith("💰"):
+                linhas_html.append(f'<div class="rel-preco">{linha}</div>')
+            elif linha.startswith("💬"):
+                linhas_html.append(f'<div class="rel-resumo">{linha}</div>')
+            elif linha.startswith("💡") or linha.startswith("🤝"):
+                linhas_html.append(f'<div class="rel-insight">{linha}</div>')
+            elif linha.startswith("_") and linha.endswith("_"):
+                linhas_html.append(f'<div class="rel-footer">{linha}</div>')
+            else:
+                linhas_html.append(f'<div class="rel-linha">{linha}</div>')
+    else:
+        linhas_html.append('<div class="rel-vazio">Nenhum relatório gerado ainda. Clique em "Disparar Agente" para começar.</div>')
 
-def formatar_mensagem(novos: list, proximos_urgentes: list, hoje: str) -> str:
-    if not novos:
-        return f"📅 *Eventos — {hoje}*\n\nNenhum evento novo hoje! Todos ja foram enviados. 👍"
+    relatorio_html = "\n".join(linhas_html)
 
-    palestras = [e for e in novos if e.get("palestra") in ("alta","media")]
-    negocios  = [e for e in novos if e.get("negocio") == "alto"]
+    uptime = status_agente.get("uptime", "—")
+    ultimo_disparo = status_agente.get("ultimo_disparo", "—")
+    proximo = status_agente.get("proximo_disparo", "—")
+    agora = datetime.now().strftime("%d/%m/%Y %H:%M")
 
-    linhas = [f"📅 *Agenda de Eventos — {hoje}*"]
-    linhas.append(f"_{len(novos)} novos eventos encontrados_\n")
+    return f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FluxIA — Painel de Eventos</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {{
+    --bg: #080C14;
+    --bg2: #0D1421;
+    --bg3: #111827;
+    --border: #1E2D45;
+    --accent: #3B82F6;
+    --accent2: #06B6D4;
+    --green: #10B981;
+    --yellow: #F59E0B;
+    --red: #EF4444;
+    --text: #E2E8F0;
+    --text2: #94A3B8;
+    --text3: #475569;
+  }}
 
-    # ALERTA URGENTE — eventos em menos de 7 dias
-    if proximos_urgentes:
-        linhas.append("⚡ *ACONTECE EM MENOS DE 7 DIAS*")
-        linhas.append("─────────────────────")
-        for ev in proximos_urgentes:
-            emoji = EMOJI_CAT.get(ev.get("categoria","outros"),"📌")
-            linhas.append(f"{emoji} *{ev.get('nome','')}*")
-            linhas.append(f"📆 {ev.get('data','')} — ⚠️ URGENTE")
-            if ev.get("local"): linhas.append(f"📍 {ev.get('local','')} | {ev.get('cidade','')}")
-            linhas.append(f"💬 {ev.get('resumo','')}")
-            linhas.append(f"💰 {ev.get('preco','A confirmar')}")
-            linhas.append(f"🔗 {ev.get('url','')}")
-            linhas.append("")
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
 
-    # OPORTUNIDADES DE PALESTRA
-    # Filtra urgentes para nao repetir
-    ids_urgentes = {e.get("url") for e in proximos_urgentes}
-    palestras_nao_urgentes = [e for e in palestras if e.get("url") not in ids_urgentes]
+  body {{
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Syne', sans-serif;
+    min-height: 100vh;
+  }}
 
-    if palestras_nao_urgentes:
-        linhas.append("🎤 *OPORTUNIDADES PARA PALESTRAR*")
-        linhas.append("─────────────────────")
-        for ev in palestras_nao_urgentes[:5]:
-            emoji = EMOJI_CAT.get(ev.get("categoria","outros"),"📌")
-            linhas.append(f"🎤 *{ev.get('nome','')}*")
-            if ev.get("data"): linhas.append(f"📆 {ev.get('data','')} | {ev.get('cidade','')}")
-            if ev.get("local"): linhas.append(f"📍 {ev.get('local','')}")
-            linhas.append(f"💡 {ev.get('motivo_palestra','')}")
-            linhas.append(f"🔗 {ev.get('url','')}")
-            linhas.append("")
+  .grid-bg {{
+    position: fixed; inset: 0;
+    background-image:
+      linear-gradient(rgba(59,130,246,0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(59,130,246,0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+  }}
 
-    # OPORTUNIDADES DE NEGOCIO
-    negocios_novos = [e for e in negocios
-                      if e.get("url") not in ids_urgentes
-                      and e not in palestras_nao_urgentes]
-    if negocios_novos:
-        linhas.append("💼 *OPORTUNIDADES DE NEGOCIO*")
-        linhas.append("─────────────────────")
-        for ev in negocios_novos[:5]:
-            emoji = EMOJI_CAT.get(ev.get("categoria","outros"),"📌")
-            linhas.append(f"{emoji} *{ev.get('nome','')}*")
-            if ev.get("data"): linhas.append(f"📆 {ev.get('data','')} | {ev.get('cidade','')}")
-            linhas.append(f"🤝 {ev.get('motivo_negocio','')}")
-            linhas.append(f"🔗 {ev.get('url','')}")
-            linhas.append("")
+  .header {{
+    border-bottom: 1px solid var(--border);
+    padding: 1.2rem 2rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky; top: 0;
+    background: rgba(8,12,20,0.95);
+    backdrop-filter: blur(12px);
+    z-index: 100;
+  }}
 
-    # DEMAIS EVENTOS
-    ids_ja_listados = ids_urgentes | {e.get("url") for e in palestras_nao_urgentes} | {e.get("url") for e in negocios_novos}
-    demais = [e for e in novos if e.get("url") not in ids_ja_listados]
+  .logo {{
+    display: flex; align-items: center; gap: 12px;
+  }}
 
-    if demais:
-        linhas.append("📋 *OUTROS EVENTOS*")
-        linhas.append("─────────────────────")
-        for ev in demais[:10]:
-            emoji = EMOJI_CAT.get(ev.get("categoria","outros"),"📌")
-            cidade = ev.get("cidade","")
-            linhas.append(f"{emoji} *{ev.get('nome','')}*" + (f" | {cidade}" if cidade else ""))
-            if ev.get("data"): linhas.append(f"📆 {ev.get('data','')}")
-            if ev.get("local"): linhas.append(f"📍 {ev.get('local','')}")
-            linhas.append(f"💬 {ev.get('resumo','')}")
-            linhas.append(f"💰 {ev.get('preco','A confirmar')}")
-            linhas.append(f"🔗 {ev.get('url','')}")
-            linhas.append("")
+  .logo-dot {{
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 12px var(--green);
+    animation: pulse 2s infinite;
+  }}
 
-    linhas.append("_Agente de Eventos FluxIA 🤖_")
-    return "\n".join(linhas)
+  @keyframes pulse {{
+    0%, 100% {{ opacity: 1; transform: scale(1); }}
+    50% {{ opacity: 0.6; transform: scale(0.85); }}
+  }}
+
+  .logo-text {{
+    font-size: 1rem; font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--text);
+  }}
+
+  .logo-sub {{
+    font-size: 0.7rem; color: var(--text3);
+    font-family: 'DM Mono', monospace;
+    letter-spacing: 0.1em;
+  }}
+
+  .header-right {{
+    font-family: 'DM Mono', monospace;
+    font-size: 0.75rem; color: var(--text3);
+  }}
+
+  .container {{
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 2rem;
+  }}
+
+  .stats-grid {{
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1rem;
+    margin-bottom: 2rem;
+  }}
+
+  .stat {{
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.2rem;
+    position: relative;
+    overflow: hidden;
+  }}
+
+  .stat::before {{
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+  }}
+
+  .stat-val {{
+    font-size: 2rem; font-weight: 800;
+    color: var(--text);
+    line-height: 1;
+    margin-bottom: 6px;
+  }}
+
+  .stat-lbl {{
+    font-size: 0.72rem;
+    color: var(--text3);
+    font-family: 'DM Mono', monospace;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }}
+
+  .main-grid {{
+    display: grid;
+    grid-template-columns: 1fr 340px;
+    gap: 1.5rem;
+  }}
+
+  .card {{
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    overflow: hidden;
+  }}
+
+  .card-header {{
+    padding: 1rem 1.4rem;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }}
+
+  .card-title {{
+    font-size: 0.8rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text2);
+    font-family: 'DM Mono', monospace;
+  }}
+
+  .card-body {{
+    padding: 1.4rem;
+  }}
+
+  /* RELATORIO */
+  .relatorio {{
+    font-family: 'DM Mono', monospace;
+    font-size: 0.82rem;
+    line-height: 1.7;
+    max-height: 600px;
+    overflow-y: auto;
+    padding-right: 8px;
+  }}
+
+  .relatorio::-webkit-scrollbar {{ width: 4px; }}
+  .relatorio::-webkit-scrollbar-track {{ background: transparent; }}
+  .relatorio::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 4px; }}
+
+  .rel-titulo {{
+    font-size: 1rem; font-weight: 700;
+    color: var(--text); margin-bottom: 8px;
+    font-family: 'Syne', sans-serif;
+  }}
+
+  .rel-secao {{
+    font-weight: 700; margin-top: 16px; margin-bottom: 4px;
+    font-family: 'Syne', sans-serif; font-size: 0.85rem;
+  }}
+
+  .rel-secao.urgente {{ color: var(--yellow); }}
+  .rel-secao.palestra {{ color: var(--accent2); }}
+  .rel-secao.negocio {{ color: var(--green); }}
+  .rel-secao.outros {{ color: var(--text2); }}
+
+  .rel-divider {{ border: none; border-top: 1px solid var(--border); margin: 6px 0; }}
+  .rel-meta {{ color: var(--text2); }}
+  .rel-preco {{ color: var(--green); }}
+  .rel-resumo {{ color: var(--text); }}
+  .rel-insight {{ color: var(--accent); }}
+  .rel-link a {{ color: var(--accent2); text-decoration: none; }}
+  .rel-link a:hover {{ text-decoration: underline; }}
+  .rel-footer {{ color: var(--text3); margin-top: 12px; font-size: 0.72rem; }}
+  .rel-vazio {{ color: var(--text3); text-align: center; padding: 2rem; }}
+  .spacer {{ height: 8px; }}
+
+  /* SIDEBAR */
+  .btn {{
+    width: 100%;
+    padding: 0.85rem;
+    border-radius: 10px;
+    border: none;
+    font-family: 'Syne', sans-serif;
+    font-weight: 700;
+    font-size: 0.85rem;
+    cursor: pointer;
+    letter-spacing: 0.04em;
+    transition: all 0.2s;
+    margin-bottom: 0.75rem;
+  }}
+
+  .btn-primary {{
+    background: var(--accent);
+    color: white;
+  }}
+  .btn-primary:hover {{ background: #2563EB; transform: translateY(-1px); }}
+
+  .btn-secondary {{
+    background: transparent;
+    color: var(--text2);
+    border: 1px solid var(--border);
+  }}
+  .btn-secondary:hover {{ border-color: var(--accent); color: var(--accent); }}
+
+  .info-row {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.7rem 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.8rem;
+  }}
+
+  .info-row:last-child {{ border-bottom: none; }}
+
+  .info-lbl {{ color: var(--text3); font-family: 'DM Mono', monospace; }}
+  .info-val {{ color: var(--text); font-weight: 600; }}
+  .info-val.green {{ color: var(--green); }}
+  .info-val.yellow {{ color: var(--yellow); }}
+
+  .badge {{
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 20px;
+    font-size: 0.7rem;
+    font-family: 'DM Mono', monospace;
+    font-weight: 500;
+  }}
+
+  .badge.online {{
+    background: rgba(16,185,129,0.15);
+    color: var(--green);
+    border: 1px solid rgba(16,185,129,0.3);
+  }}
+
+  .toast {{
+    position: fixed;
+    bottom: 2rem; right: 2rem;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1rem 1.4rem;
+    font-size: 0.85rem;
+    display: none;
+    z-index: 999;
+    animation: slideIn 0.3s ease;
+  }}
+
+  @keyframes slideIn {{
+    from {{ transform: translateY(20px); opacity: 0; }}
+    to {{ transform: translateY(0); opacity: 1; }}
+  }}
+
+  @media (max-width: 768px) {{
+    .stats-grid {{ grid-template-columns: repeat(2, 1fr); }}
+    .main-grid {{ grid-template-columns: 1fr; }}
+    .container {{ padding: 1rem; }}
+  }}
+</style>
+</head>
+<body>
+<div class="grid-bg"></div>
+
+<div class="header">
+  <div class="logo">
+    <div class="logo-dot"></div>
+    <div>
+      <div class="logo-text">FluxIA</div>
+      <div class="logo-sub">PAINEL DE EVENTOS</div>
+    </div>
+  </div>
+  <div class="header-right">Atualizado: {agora}</div>
+</div>
+
+<div class="container">
+
+  <div class="stats-grid">
+    <div class="stat">
+      <div class="stat-val">{total_enviados}</div>
+      <div class="stat-lbl">Eventos na memória</div>
+    </div>
+    <div class="stat">
+      <div class="stat-val" style="color:var(--green)">ON</div>
+      <div class="stat-lbl">Status do agente</div>
+    </div>
+    <div class="stat">
+      <div class="stat-val" style="font-size:1.1rem">{ultimo_disparo}</div>
+      <div class="stat-lbl">Último disparo</div>
+    </div>
+    <div class="stat">
+      <div class="stat-val" style="font-size:1.1rem">{proximo}</div>
+      <div class="stat-lbl">Próximo disparo</div>
+    </div>
+  </div>
+
+  <div class="main-grid">
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Último Relatório de Eventos</span>
+        <span class="badge online">
+          <span style="width:6px;height:6px;border-radius:50%;background:var(--green);display:inline-block"></span>
+          AO VIVO
+        </span>
+      </div>
+      <div class="card-body">
+        <div class="relatorio">
+          {relatorio_html}
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <div class="card" style="margin-bottom:1rem">
+        <div class="card-header">
+          <span class="card-title">Controles</span>
+        </div>
+        <div class="card-body">
+          <button class="btn btn-primary" onclick="disparar()">
+            ⚡ Disparar Agente Agora
+          </button>
+          <button class="btn btn-secondary" onclick="location.reload()">
+            ↻ Atualizar Painel
+          </button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Informações</span>
+        </div>
+        <div class="card-body">
+          <div class="info-row">
+            <span class="info-lbl">Status</span>
+            <span class="info-val green">Online</span>
+          </div>
+          <div class="info-row">
+            <span class="info-lbl">Uptime</span>
+            <span class="info-val">{uptime}</span>
+          </div>
+          <div class="info-row">
+            <span class="info-lbl">Memória</span>
+            <span class="info-val">{total_enviados} eventos</span>
+          </div>
+          <div class="info-row">
+            <span class="info-lbl">Último</span>
+            <span class="info-val">{ultimo_disparo}</span>
+          </div>
+          <div class="info-row">
+            <span class="info-lbl">Próximo</span>
+            <span class="info-val yellow">{proximo}</span>
+          </div>
+          <div class="info-row">
+            <span class="info-lbl">Cidades</span>
+            <span class="info-val" style="font-size:0.72rem">JP · CG · Recife · Natal · FOR · Mac</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+function mostrarToast(msg, cor) {{
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  t.style.borderColor = cor || '#3B82F6';
+  setTimeout(() => {{ t.style.display = 'none'; }}, 4000);
+}}
+
+function disparar() {{
+  mostrarToast('⚡ Agente disparado! Acompanhe os logs...', '#10B981');
+  fetch('/testar').then(r => r.text()).then(t => {{
+    mostrarToast('✅ ' + t.substring(0, 60), '#10B981');
+  }}).catch(() => {{
+    mostrarToast('❌ Erro ao disparar', '#EF4444');
+  }});
+}}
+
+// Auto-refresh a cada 60 segundos
+setTimeout(() => location.reload(), 60000);
+</script>
+</body>
+</html>"""
 
 
-# --------------------------------------------------
-# PRINCIPAL
-# --------------------------------------------------
-
-def rodar_agente():
-    hoje_dt  = date.today()
-    hoje_str = hoje_dt.strftime("%d/%m/%Y")
-
-    print("=" * 50)
-    print(f"Agente de Eventos — {hoje_str}")
-    print("=" * 50)
-
-    memoria = carregar_memoria()
-    print(f"Memoria: {len(memoria)} eventos ja enviados\n")
-
-    # FASE 1 — busca
-    print("FASE 1: Buscando eventos...")
-    resultados_brutos = buscar_todos_eventos()
-
-    if not resultados_brutos:
-        print("Sem resultados. Verifique TAVILY_API_KEY.")
-        _alertar_admin("Agente de eventos: zero resultados de busca. Verifique Tavily.")
-        return
-
-    # FASE 2 — extrai com IA
-    print("\nFASE 2: Extraindo eventos com IA...")
-    eventos = extrair_eventos(resultados_brutos, hoje_str)
-    print(f"Extraidos: {len(eventos)}")
-
-    if not eventos:
-        print("Nenhum evento valido.")
-        return
-
-    # FASE 3 — filtra passados (no codigo, nao so no prompt)
-    print("\nFASE 3: Filtrando eventos passados...")
-    futuros, proximos_urgentes, passados = filtrar_eventos_validos(eventos, hoje_dt)
-    print(f"Futuros: {len(futuros)} | Proximos 7 dias: {len(proximos_urgentes)} | Passados descartados: {len(passados)}")
-
-    # FASE 4 — filtra ja enviados (memoria)
-    print("\nFASE 4: Filtrando ja enviados...")
-    novos = []
-    for ev in futuros:
-        ev_id = gerar_id(ev.get("url","") or ev.get("nome",""))
-        if ev_id not in memoria:
-            ev["_id"] = ev_id
-            novos.append(ev)
-
-    # Proximos urgentes novos (para destaque)
-    ids_novos = {e.get("url") for e in novos}
-    proximos_novos = [e for e in proximos_urgentes if e.get("url") in ids_novos]
-
-    print(f"Novos: {len(novos)} | Urgentes (7 dias): {len(proximos_novos)}")
-
-    if not novos:
-        enviar_whatsapp(f"📅 *Eventos — {hoje_str}*\n\nNenhum evento novo hoje! Todos ja foram enviados. 👍")
-        return
-
-    # FASE 5 — formata e envia
-    mensagem = formatar_mensagem(novos, proximos_novos, hoje_str)
-
-    caminho = f"relatorio_{hoje_dt.strftime('%Y-%m-%d')}.txt"
-    with open(caminho, "w", encoding="utf-8") as f:
-        f.write(mensagem)
-    print(f"\nSalvo: {caminho}")
-    print(mensagem[:600])
-
-    enviado = enviar_whatsapp(mensagem)
-
-    # Atualiza memoria
-    for ev in novos:
-        memoria.add(ev["_id"])
-    salvar_memoria(memoria)
-    print(f"Memoria: {len(memoria)} eventos registrados")
-
-    if not enviado:
-        print("AVISO: WhatsApp nao enviado.")
-
-
-if __name__ == "__main__":
-    rodar_agente()
+def get_painel_html(status_agente: dict) -> str:
+    total = len(carregar_eventos_memoria())
+    relatorio = carregar_ultimo_relatorio()
+    return gerar_html_painel(relatorio, total, status_agente)
