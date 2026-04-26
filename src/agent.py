@@ -1,74 +1,58 @@
 """
-Agente de Eventos — Joao Pessoa + Cidades Proximas
-- Usa apenas OpenAI (sem confusao com OpenRouter)
-- Pesquisa como palestrar em cada evento (call for speakers, contato)
-- Calcula custo-beneficio de viagem para outras cidades
+Agente de Eventos — Joao Pessoa + Cidades do Nordeste
+- Sem repeticao de eventos (memoria persistente)
+- Sem eventos passados (filtro por data no codigo)
+- Alerta para eventos proximos (menos de 7 dias)
+- Todas as cidades tratadas igual JP
+- Fallback entre 3 chaves Tavily com alerta WhatsApp
 """
 
-import os
-import json
-import hashlib
-import httpx
-import re
-import time
-from datetime import datetime
+import os, json, hashlib, httpx, re, time
+from datetime import datetime, date, timedelta
 from openai import OpenAI
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 MODELO = os.environ.get("MODELO_IA", "gpt-4o-mini")
-
 MEMORIA_PATH = "data/eventos_enviados.json"
 
 PERFIL = """
 Abel — dono da FluxIA (agencia de IA no Nordeste)
 Cria: agentes de atendimento, sistemas SaaS, APIs, automacoes para clinicas
-Quer: palestrar, fazer networking, vender IA para clinicas e empresas
-Publico-alvo: donos de clinicas (odonto, estetica, medica), empreendedores
-Tema de palestra: IA aplicada a negocios, agentes de atendimento, automacao para clinicas
+Quer: palestrar, networking, vender IA para clinicas e empresas
+Publico-alvo: donos de clinicas, empreendedores, profissionais de saude
+Tema: IA aplicada a negocios, automacao, agentes de atendimento
 """
 
-# Custo estimado de viagem por cidade (ida+volta + 1 dia)
-CUSTO_VIAGEM = {
-    "joao_pessoa":    0,
-    "campina_grande": 80,    # onibus ~2h
-    "recife":         150,   # onibus/carro ~2h + possivel hospedagem
-    "natal":          200,   # onibus ~3h + possivel hospedagem
-    "fortaleza":      500,   # passagem + hospedagem obrigatoria
-}
-
-QUERIES_EVENTOS = [
-    "eventos Joao Pessoa PB 2026 site:sympla.com.br",
-    "eventos Joao Pessoa PB 2026 site:even3.com.br",
-    "eventos Joao Pessoa PB 2026 site:doity.com.br",
-    "eventos Joao Pessoa 2026 site:eventbrite.com.br",
-    "workshop inteligencia artificial Joao Pessoa 2026",
-    "evento tecnologia startups Joao Pessoa 2026",
-    "evento marketing digital Joao Pessoa 2026",
-    "evento empreendedorismo negocios Joao Pessoa 2026",
-    "congresso odontologia Paraiba 2026",
-    "evento clinicas saude estetica Joao Pessoa 2026",
-    "evento SEBRAE Paraiba Joao Pessoa 2026",
-    "evento ACIPB CDL Joao Pessoa 2026",
-    "evento CRO CRM Paraiba 2026",
-    "startup PB inovacao evento 2026",
-    "evento SENAC Joao Pessoa 2026",
-    "summit conferencia Recife PE 2026 site:sympla.com.br",
-    "evento tecnologia inovacao Recife 2026",
-    "evento empreendedorismo Campina Grande PB 2026",
-    "evento tecnologia Campina Grande PB 2026",
-    "evento empreendedorismo Natal RN 2026",
-    "congresso saude clinicas Nordeste 2026",
-    "evento IA inteligencia artificial Nordeste 2026",
+# Cidades — todas tratadas com mesma prioridade
+CIDADES = [
+    "Joao Pessoa PB",
+    "Campina Grande PB",
+    "Recife PE",
+    "Natal RN",
+    "Fortaleza CE",
+    "Maceio AL",
 ]
 
-# Queries especificas para buscar como palestrar
-def queries_palestra(nome_evento: str, url: str) -> list:
-    nome_curto = nome_evento[:40]
-    return [
-        f'"{nome_curto}" call for speakers 2026',
-        f'"{nome_curto}" como palestrar submeter proposta',
-        f'site:{url.split("/")[2]} call for speakers palestrantes',
+QUERIES_EVENTOS = []
+for cidade in CIDADES:
+    QUERIES_EVENTOS += [
+        f"eventos {cidade} 2026 site:sympla.com.br",
+        f"eventos {cidade} 2026 site:even3.com.br",
+        f"evento tecnologia IA {cidade} 2026",
+        f"evento empreendedorismo negocios {cidade} 2026",
+        f"congresso saude clinicas {cidade} 2026",
+        f"evento marketing digital {cidade} 2026",
     ]
+
+# Queries extras para JP (cidade principal)
+QUERIES_EVENTOS += [
+    "eventos Joao Pessoa 2026 site:doity.com.br",
+    "eventos Joao Pessoa 2026 site:eventbrite.com.br",
+    "evento SEBRAE Paraiba 2026",
+    "evento CRO CRM Paraiba 2026",
+    "startup PB inovacao evento 2026",
+    "evento SENAC ACIPB CDL Joao Pessoa 2026",
+]
 
 
 # --------------------------------------------------
@@ -92,254 +76,112 @@ def gerar_id(texto: str) -> str:
 
 
 # --------------------------------------------------
-# TAVILY
+# TAVILY — fallback entre multiplas chaves
 # --------------------------------------------------
+
+def _get_tavily_keys() -> list:
+    chaves = []
+    for var in ["TAVILY_API_KEY", "TAVILY_API_KEY_2", "TAVILY_API_KEY_3"]:
+        k = os.environ.get(var)
+        if k:
+            chaves.append(k)
+    return chaves
+
+def _alertar_admin(msg: str):
+    base = os.environ.get("EVOLUTION_API_URL","").rstrip("/manager").rstrip("/")
+    key  = os.environ.get("EVOLUTION_API_KEY","")
+    inst = os.environ.get("EVOLUTION_INSTANCE","")
+    num  = os.environ.get("WHATSAPP_ADMIN", os.environ.get("WHATSAPP_NUMERO_DESTINO",""))
+    if not all([base, key, inst, num]):
+        return
+    try:
+        httpx.post(f"{base}/message/sendText/{inst}",
+            json={"number": num, "text": f"🚨 ALERTA AGENTE: {msg}"},
+            headers={"apikey": key, "Content-Type": "application/json"}, timeout=10)
+    except Exception:
+        pass
 
 def buscar_tavily(query: str, max_results: int = 5) -> list:
-    api_key = os.environ.get("TAVILY_API_KEY")
-    if not api_key:
-        return []
-    try:
-        r = httpx.post(
-            "https://api.tavily.com/search",
-            json={"api_key": api_key, "query": query,
-                  "search_depth": "basic", "max_results": max_results},
-            timeout=15
-        )
-        return r.json().get("results", [])
-    except Exception as e:
-        print(f"  Erro Tavily: {e}")
+    chaves = _get_tavily_keys()
+    if not chaves:
+        print("  Nenhuma TAVILY_API_KEY configurada")
         return []
 
-
-def acessar_pagina(url: str) -> str:
-    try:
-        r = httpx.get(url, headers={"User-Agent": "Mozilla/5.0"},
-                      timeout=10, follow_redirects=True)
-        texto = re.sub(r"<style[^>]*>.*?</style>", " ", r.text, flags=re.DOTALL)
-        texto = re.sub(r"<script[^>]*>.*?</script>", " ", texto, flags=re.DOTALL)
-        texto = re.sub(r"<[^>]+>", " ", texto)
-        return re.sub(r"\s+", " ", texto).strip()[:800]
-    except Exception:
-        return ""
-
-
-# --------------------------------------------------
-# FASE 1 — BUSCA DE EVENTOS
-# --------------------------------------------------
-
-def buscar_todos_eventos() -> list:
-    print(f"Fazendo {len(QUERIES_EVENTOS)} buscas...")
-    todos = []
-    for i, query in enumerate(QUERIES_EVENTOS):
-        print(f"  [{i+1}/{len(QUERIES_EVENTOS)}] {query[:60]}")
-        resultados = buscar_tavily(query, max_results=5)
-        for res in resultados:
-            todos.append({
-                "titulo": res.get("title", "")[:100],
-                "url":    res.get("url", ""),
-                "resumo": res.get("content", "")[:180],
-            })
-        time.sleep(0.3)
-    print(f"Total bruto: {len(todos)} resultados")
-    return todos
+    for i, api_key in enumerate(chaves):
+        try:
+            r = httpx.post(
+                "https://api.tavily.com/search",
+                json={"api_key": api_key, "query": query,
+                      "search_depth": "basic", "max_results": max_results},
+                timeout=15
+            )
+            data = r.json()
+            if r.status_code == 429 or "quota" in str(data).lower() or "limit" in str(data).lower():
+                print(f"  Chave Tavily {i+1} com limite — tentando proxima...")
+                if i == len(chaves) - 1:
+                    _alertar_admin(
+                        "Todas as chaves Tavily atingiram o limite! "
+                        "Agente de eventos sem busca. Renove os creditos em tavily.com"
+                    )
+                continue
+            return data.get("results", [])
+        except Exception as e:
+            print(f"  Erro Tavily chave {i+1}: {e}")
+            continue
+    return []
 
 
 # --------------------------------------------------
-# FASE 2 — EXTRAIR EVENTOS COM IA
+# FILTRO DE DATA — robusto, no codigo (nao so no prompt)
 # --------------------------------------------------
 
-def extrair_eventos(resultados_brutos: list, hoje: str) -> list:
-    contexto = "\n".join([
-        f"- {r['titulo']} | {r['url']} | {r['resumo'][:120]}"
-        for r in resultados_brutos[:80]
-    ])
+def extrair_data(texto: str):
+    """Tenta extrair data do texto. Retorna objeto date ou None."""
+    if not texto:
+        return None
+    # Formato DD/MM/AAAA
+    m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", texto)
+    if m:
+        try:
+            return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            pass
+    # Formato AAAA-MM-DD
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", texto)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+    return None
 
-    prompt = f"""Hoje e {hoje}. Extraia eventos reais desses resultados de busca.
-
-PERFIL:
-{PERFIL}
-
-RESULTADOS:
-{contexto}
-
-REGRAS:
-1. Apenas eventos FUTUROS (apos {hoje})
-2. Apenas em JP, Campina Grande, Recife ou Natal
-3. Descarte noticias, cursos online permanentes, resultados que nao sejam eventos datados
-4. Seja conservador — se nao tiver certeza que e evento futuro, descarte
-
-Retorne APENAS JSON valido sem markdown:
-[
-  {{
-    "nome": "nome completo do evento",
-    "data": "DD/MM/AAAA ou vazio se nao souber",
-    "local": "local fisico ou Online",
-    "cidade": "joao_pessoa|campina_grande|recife|natal",
-    "resumo": "2 frases diretas sobre o evento",
-    "preco": "Gratuito|R$ valor|A confirmar",
-    "url": "url exata",
-    "categoria": "tecnologia_ia|marketing|negocios_empreend|saude_clinicas|outros",
-    "publico_estimado": "pequeno(<50)|medio(50-200)|grande(+200)|desconhecido",
-    "potencial_negocio": "alto|medio|baixo",
-    "motivo_negocio": "quem estara presente e por que Abel pode vender"
-  }}
-]"""
-
-    try:
-        r = client.chat.completions.create(
-            model=MODELO,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=3000,
-        )
-        resposta = r.choices[0].message.content.strip()
-        resposta = re.sub(r"```json|```", "", resposta).strip()
-        match = re.search(r"\[.*\]", resposta, re.DOTALL)
-        if match:
-            return json.loads(match.group())
-        return json.loads(resposta)
-    except Exception as e:
-        print(f"Erro ao extrair eventos: {e}")
-        return []
-
-
-# --------------------------------------------------
-# FASE 3 — PESQUISAR COMO PALESTRAR
-# --------------------------------------------------
-
-def pesquisar_como_palestrar(evento: dict) -> dict:
+def filtrar_eventos_validos(eventos: list, hoje: date) -> tuple:
     """
-    Para cada evento com potencial de palestra,
-    busca informacoes reais sobre como se tornar palestrante.
+    Retorna (futuros, proximos_7_dias, passados)
+    proximos_7_dias = eventos nos proximos 7 dias (alerta urgente)
     """
-    nome = evento.get("nome", "")
-    url  = evento.get("url", "")
+    futuros = []
+    proximos = []
+    passados = []
 
-    print(f"  Pesquisando como palestrar: {nome[:50]}")
+    for ev in eventos:
+        data_ev = extrair_data(ev.get("data", ""))
 
-    info_palestra = {
-        "tem_call_for_speakers": False,
-        "como_palestrar": "",
-        "contato": "",
-        "prazo_submissao": "",
-        "link_inscricao_palestrante": "",
-    }
+        if data_ev is None:
+            # Sem data definida — inclui mas sem alerta
+            futuros.append(ev)
+            continue
 
-    # Busca informacoes sobre call for speakers
-    queries = [
-        f"{nome} call for speakers palestrantes 2026",
-        f"{nome} como se tornar palestrante submeter proposta",
-        f'site:{url.split("/")[2] if "/" in url else url} palestrante speaker',
-    ]
+        if data_ev < hoje:
+            passados.append(ev)
+            print(f"  Descartado (passado): {ev.get('nome','')} — {ev.get('data','')}")
+        else:
+            futuros.append(ev)
+            # Verifica se e nos proximos 7 dias
+            if data_ev <= hoje + timedelta(days=7):
+                proximos.append(ev)
 
-    resultados = []
-    for q in queries[:2]:  # limita para nao gastar muita Tavily
-        res = buscar_tavily(q, max_results=3)
-        resultados.extend(res)
-        time.sleep(0.2)
-
-    # Tenta acessar a pagina do evento para buscar info de palestrante
-    conteudo_pagina = acessar_pagina(url) if url else ""
-
-    if not resultados and not conteudo_pagina:
-        info_palestra["como_palestrar"] = "Nao encontrado — contate os organizadores diretamente"
-        return info_palestra
-
-    # IA analisa e extrai informacoes de como palestrar
-    contexto_palestra = "\n".join([
-        f"- {r.get('title','')} | {r.get('url','')} | {r.get('content','')[:150]}"
-        for r in resultados[:6]
-    ])
-    if conteudo_pagina:
-        contexto_palestra += f"\n\nCONTEUDO DA PAGINA DO EVENTO:\n{conteudo_pagina[:600]}"
-
-    prompt = f"""Analise as informacoes abaixo sobre o evento "{nome}" e extraia como Abel pode palestrar.
-
-Abel quer saber:
-1. Existe call for speakers / submissao de propostas aberta?
-2. Qual o processo para se tornar palestrante?
-3. Tem prazo para submissao?
-4. Qual contato ou link para se inscrever como palestrante?
-5. Se nao tiver processo formal, qual a melhor estrategia para Abel conseguir falar nesse evento?
-
-INFORMACOES ENCONTRADAS:
-{contexto_palestra}
-
-Retorne APENAS JSON valido:
-{{
-  "tem_call_for_speakers": true|false,
-  "como_palestrar": "instrucoes claras e praticas em 2-3 frases",
-  "contato": "email ou link de contato dos organizadores",
-  "prazo_submissao": "data limite ou vazio",
-  "link_inscricao_palestrante": "link direto ou vazio",
-  "estrategia_recomendada": "o que Abel deve fazer especificamente para entrar como palestrante"
-}}"""
-
-    try:
-        r = client.chat.completions.create(
-            model=MODELO,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=500,
-        )
-        resposta = r.choices[0].message.content.strip()
-        resposta = re.sub(r"```json|```", "", resposta).strip()
-        return json.loads(resposta)
-    except Exception as e:
-        print(f"  Erro ao analisar palestra: {e}")
-        info_palestra["como_palestrar"] = "Erro ao buscar — verifique o site do evento"
-        return info_palestra
-
-
-# --------------------------------------------------
-# FASE 4 — CALCULAR CUSTO-BENEFICIO (outras cidades)
-# --------------------------------------------------
-
-def calcular_custo_beneficio(evento: dict) -> dict:
-    cidade = evento.get("cidade", "joao_pessoa")
-    if cidade == "joao_pessoa":
-        return {"vale_ir": True, "analise": "", "custo_estimado": 0}
-
-    custo = CUSTO_VIAGEM.get(cidade, 200)
-    publico = evento.get("publico_estimado", "desconhecido")
-    potencial = evento.get("potencial_negocio", "baixo")
-    categoria = evento.get("categoria", "outros")
-
-    # Score de valor
-    score_publico  = {"pequeno(<50)": 1, "medio(50-200)": 2, "grande(+200)": 3, "desconhecido": 1}.get(publico, 1)
-    score_potencial = {"alto": 3, "medio": 2, "baixo": 1}.get(potencial, 1)
-    score_categoria = 3 if categoria in ("tecnologia_ia", "negocios_empreend", "saude_clinicas") else 1
-    score_total = score_publico + score_potencial + score_categoria  # max: 9
-
-    # Decide se vale ir
-    # Eventos pequenos de baixo potencial nao valem viagem
-    if custo <= 100:
-        vale_ir = score_total >= 4
-    elif custo <= 200:
-        vale_ir = score_total >= 6
-    else:
-        vale_ir = score_total >= 8
-
-    if vale_ir:
-        analise = (
-            f"Vale a viagem! Custo estimado: R${custo}. "
-            f"Publico {publico}, potencial de negocio {potencial}. "
-            f"Oportunidade de networking e visibilidade justifica o investimento."
-        )
-    else:
-        analise = (
-            f"Custo R${custo} nao justifica para esse evento. "
-            f"Publico {publico} e potencial {potencial} sao baixos demais. "
-            f"Monitore para proximas edicoes quando tiver mais informacoes."
-        )
-
-    return {
-        "vale_ir": vale_ir,
-        "custo_estimado": custo,
-        "analise": analise,
-        "score": score_total,
-    }
+    return futuros, proximos, passados
 
 
 # --------------------------------------------------
@@ -347,7 +189,7 @@ def calcular_custo_beneficio(evento: dict) -> dict:
 # --------------------------------------------------
 
 def enviar_whatsapp(mensagem: str) -> bool:
-    base_url = os.environ.get("EVOLUTION_API_URL", "").rstrip("/manager").rstrip("/")
+    base_url = os.environ.get("EVOLUTION_API_URL","").rstrip("/manager").rstrip("/")
     api_key  = os.environ.get("EVOLUTION_API_KEY")
     instance = os.environ.get("EVOLUTION_INSTANCE")
     numero   = os.environ.get("WHATSAPP_NUMERO_DESTINO")
@@ -356,7 +198,7 @@ def enviar_whatsapp(mensagem: str) -> bool:
         print("WhatsApp nao configurado.")
         return False
 
-    partes = dividir_mensagem(mensagem)
+    partes = _dividir_mensagem(mensagem)
     for i, parte in enumerate(partes):
         try:
             r = httpx.post(
@@ -377,8 +219,7 @@ def enviar_whatsapp(mensagem: str) -> bool:
             time.sleep(2)
     return True
 
-
-def dividir_mensagem(texto: str, limite: int = 3500) -> list:
+def _dividir_mensagem(texto: str, limite: int = 3500) -> list:
     if len(texto) <= limite:
         return [texto]
     partes = []
@@ -397,6 +238,94 @@ def dividir_mensagem(texto: str, limite: int = 3500) -> list:
 
 
 # --------------------------------------------------
+# FASE 1 — BUSCA
+# --------------------------------------------------
+
+def buscar_todos_eventos() -> list:
+    print(f"Fazendo {len(QUERIES_EVENTOS)} buscas...")
+    todos = []
+    for i, query in enumerate(QUERIES_EVENTOS):
+        print(f"  [{i+1}/{len(QUERIES_EVENTOS)}] {query[:65]}")
+        resultados = buscar_tavily(query, max_results=5)
+        for res in resultados:
+            todos.append({
+                "titulo": res.get("title","")[:100],
+                "url":    res.get("url",""),
+                "resumo": res.get("content","")[:180],
+            })
+        time.sleep(0.3)
+    print(f"Total bruto: {len(todos)} resultados")
+    return todos
+
+
+# --------------------------------------------------
+# FASE 2 — EXTRAIR EVENTOS COM IA
+# --------------------------------------------------
+
+SYSTEM_EXTRAIR = f"""Voce e um agente que extrai eventos de resultados de busca.
+
+PERFIL DE QUEM VAI RECEBER:
+{PERFIL}
+
+REGRAS:
+1. Extraia APENAS eventos com data futura confirmada ou provavelmente futura
+2. Inclua eventos de: Joao Pessoa, Campina Grande, Recife, Natal, Fortaleza, Maceio
+3. Descarte noticias, cursos online permanentes, resultados sem data
+4. Inclua todos os tipos relevantes: tech, IA, marketing, negocios, saude, clinicas
+5. Para palestra: avalie se Abel pode palestrar (alta/media/baixa/nenhuma)
+6. Para negocio: avalie se e oportunidade de venda de IA
+
+Retorne APENAS JSON valido sem markdown:
+[
+  {{
+    "nome": "nome completo",
+    "data": "DD/MM/AAAA ou vazio",
+    "local": "local ou Online",
+    "cidade": "nome da cidade",
+    "resumo": "2 frases diretas",
+    "preco": "Gratuito|R$ valor|A confirmar",
+    "url": "url exata",
+    "categoria": "tecnologia_ia|marketing|negocios_empreend|saude_clinicas|outros",
+    "palestra": "alta|media|baixa|nenhuma",
+    "motivo_palestra": "por que e ou nao oportunidade",
+    "negocio": "alto|medio|baixo",
+    "motivo_negocio": "quem estara e por que Abel pode vender"
+  }}
+]"""
+
+def extrair_eventos(resultados_brutos: list, hoje: str) -> list:
+    if not resultados_brutos:
+        return []
+
+    contexto = "\n".join([
+        f"- {r['titulo']} | {r['url']} | {r['resumo'][:120]}"
+        for r in resultados_brutos[:80]
+    ])
+
+    prompt = f"Hoje e {hoje}. Extraia eventos futuros relevantes desses resultados:\n\n{contexto}"
+
+    try:
+        r = client.chat.completions.create(
+            model=MODELO,
+            messages=[
+                {"role": "system", "content": SYSTEM_EXTRAIR},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1,
+            max_tokens=3000,
+        )
+        resposta = r.choices[0].message.content.strip()
+        resposta = re.sub(r"```json|```", "", resposta).strip()
+        match = re.search(r"\[.*\]", resposta, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        return json.loads(resposta)
+    except Exception as e:
+        print(f"Erro ao extrair eventos: {e}")
+        return []
+
+
+# --------------------------------------------------
 # FORMATAR MENSAGEM
 # --------------------------------------------------
 
@@ -407,101 +336,80 @@ EMOJI_CAT = {
     "saude_clinicas":    "🏥",
     "outros":            "📌",
 }
-EMOJI_CIDADE = {
-    "joao_pessoa":    "🏙️ JP",
-    "campina_grande": "🏔️ CG",
-    "recife":         "🌊 Recife",
-    "natal":          "☀️ Natal",
-}
 
-def formatar_mensagem(eventos_com_analise: list) -> str:
-    hoje = datetime.now().strftime("%d/%m/%Y")
+def formatar_mensagem(novos: list, proximos_urgentes: list, hoje: str) -> str:
+    if not novos:
+        return f"📅 *Eventos — {hoje}*\n\nNenhum evento novo hoje! Todos ja foram enviados. 👍"
 
-    if not eventos_com_analise:
-        return f"📅 *Eventos — {hoje}*\n\nNenhum evento novo hoje! 👍"
+    palestras = [e for e in novos if e.get("palestra") in ("alta","media")]
+    negocios  = [e for e in novos if e.get("negocio") == "alto"]
 
-    # Separa por tipo
-    com_palestra   = [e for e in eventos_com_analise if e.get("_palestra", {}).get("tem_call_for_speakers")]
-    sem_call       = [e for e in eventos_com_analise
-                      if not e.get("_palestra", {}).get("tem_call_for_speakers")
-                      and e.get("potencial_negocio") in ("alto", "medio")
-                      and e.get("cidade") == "joao_pessoa"]
-    vale_viagem    = [e for e in eventos_com_analise
-                      if e.get("cidade") != "joao_pessoa"
-                      and e.get("_viagem", {}).get("vale_ir")]
-    nao_vale       = [e for e in eventos_com_analise
-                      if e.get("cidade") != "joao_pessoa"
-                      and not e.get("_viagem", {}).get("vale_ir")]
+    linhas = [f"📅 *Agenda de Eventos — {hoje}*"]
+    linhas.append(f"_{len(novos)} novos eventos encontrados_\n")
 
-    linhas = [f"📅 *Agenda — {hoje}*\n"]
-
-    # Eventos com call for speakers aberto
-    if com_palestra:
-        linhas.append("🎤 *CALL FOR SPEAKERS ABERTO*")
-        linhas.append("_Submeta sua proposta agora!_")
+    # ALERTA URGENTE — eventos em menos de 7 dias
+    if proximos_urgentes:
+        linhas.append("⚡ *ACONTECE EM MENOS DE 7 DIAS*")
         linhas.append("─────────────────────")
-        for ev in com_palestra:
-            p = ev.get("_palestra", {})
-            emoji = EMOJI_CAT.get(ev.get("categoria", "outros"), "📌")
-            linhas.append(f"{emoji} *{ev.get('nome', '')}*")
-            if ev.get("data"):  linhas.append(f"📆 {ev['data']}")
-            linhas.append(f"📍 {ev.get('local', '')} | {EMOJI_CIDADE.get(ev.get('cidade',''), '')}")
-            linhas.append(f"👥 Publico: {ev.get('publico_estimado', 'desconhecido')}")
-            linhas.append(f"\n📋 *Como palestrar:*")
-            linhas.append(f"{p.get('como_palestrar', '')}")
-            if p.get("prazo_submissao"):
-                linhas.append(f"⏰ Prazo: {p['prazo_submissao']}")
-            if p.get("link_inscricao_palestrante"):
-                linhas.append(f"🔗 Inscrição: {p['link_inscricao_palestrante']}")
-            elif p.get("contato"):
-                linhas.append(f"📩 Contato: {p['contato']}")
-            linhas.append(f"🌐 Evento: {ev.get('url', '')}")
-            if ev.get("potencial_negocio") == "alto":
-                linhas.append(f"💼 Negócio: {ev.get('motivo_negocio', '')}")
+        for ev in proximos_urgentes:
+            emoji = EMOJI_CAT.get(ev.get("categoria","outros"),"📌")
+            linhas.append(f"{emoji} *{ev.get('nome','')}*")
+            linhas.append(f"📆 {ev.get('data','')} — ⚠️ URGENTE")
+            if ev.get("local"): linhas.append(f"📍 {ev.get('local','')} | {ev.get('cidade','')}")
+            linhas.append(f"💬 {ev.get('resumo','')}")
+            linhas.append(f"💰 {ev.get('preco','A confirmar')}")
+            linhas.append(f"🔗 {ev.get('url','')}")
             linhas.append("")
 
-    # Eventos sem call formal mas com estrategia
-    if sem_call:
-        linhas.append("🎯 *ESTRATEGIA PARA PALESTRAR*")
-        linhas.append("_Sem call aberto — use a estrategia abaixo_")
+    # OPORTUNIDADES DE PALESTRA
+    # Filtra urgentes para nao repetir
+    ids_urgentes = {e.get("url") for e in proximos_urgentes}
+    palestras_nao_urgentes = [e for e in palestras if e.get("url") not in ids_urgentes]
+
+    if palestras_nao_urgentes:
+        linhas.append("🎤 *OPORTUNIDADES PARA PALESTRAR*")
         linhas.append("─────────────────────")
-        for ev in sem_call[:4]:
-            p = ev.get("_palestra", {})
-            emoji = EMOJI_CAT.get(ev.get("categoria", "outros"), "📌")
-            linhas.append(f"{emoji} *{ev.get('nome', '')}*")
-            if ev.get("data"):  linhas.append(f"📆 {ev['data']}")
-            linhas.append(f"📍 {ev.get('local', '')} | {EMOJI_CIDADE.get(ev.get('cidade',''), '')}")
-            linhas.append(f"💡 *Estrategia:* {p.get('estrategia_recomendada', '')}")
-            if p.get("contato"):
-                linhas.append(f"📩 Contato: {p['contato']}")
-            linhas.append(f"🌐 {ev.get('url', '')}")
-            if ev.get("potencial_negocio") == "alto":
-                linhas.append(f"💼 {ev.get('motivo_negocio', '')}")
+        for ev in palestras_nao_urgentes[:5]:
+            emoji = EMOJI_CAT.get(ev.get("categoria","outros"),"📌")
+            linhas.append(f"🎤 *{ev.get('nome','')}*")
+            if ev.get("data"): linhas.append(f"📆 {ev.get('data','')} | {ev.get('cidade','')}")
+            if ev.get("local"): linhas.append(f"📍 {ev.get('local','')}")
+            linhas.append(f"💡 {ev.get('motivo_palestra','')}")
+            linhas.append(f"🔗 {ev.get('url','')}")
             linhas.append("")
 
-    # Vale a viagem
-    if vale_viagem:
-        linhas.append("✈️ *VALE A VIAGEM*")
+    # OPORTUNIDADES DE NEGOCIO
+    negocios_novos = [e for e in negocios
+                      if e.get("url") not in ids_urgentes
+                      and e not in palestras_nao_urgentes]
+    if negocios_novos:
+        linhas.append("💼 *OPORTUNIDADES DE NEGOCIO*")
         linhas.append("─────────────────────")
-        for ev in vale_viagem:
-            v = ev.get("_viagem", {})
-            emoji = EMOJI_CAT.get(ev.get("categoria", "outros"), "📌")
-            cidade = EMOJI_CIDADE.get(ev.get("cidade", ""), "")
-            linhas.append(f"{emoji} *{ev.get('nome', '')}* | {cidade}")
-            if ev.get("data"):  linhas.append(f"📆 {ev['data']}")
-            linhas.append(f"💰 Custo viagem: ~R${v.get('custo_estimado', 0)}")
-            linhas.append(f"📊 {v.get('analise', '')}")
-            linhas.append(f"🌐 {ev.get('url', '')}")
+        for ev in negocios_novos[:5]:
+            emoji = EMOJI_CAT.get(ev.get("categoria","outros"),"📌")
+            linhas.append(f"{emoji} *{ev.get('nome','')}*")
+            if ev.get("data"): linhas.append(f"📆 {ev.get('data','')} | {ev.get('cidade','')}")
+            linhas.append(f"🤝 {ev.get('motivo_negocio','')}")
+            linhas.append(f"🔗 {ev.get('url','')}")
             linhas.append("")
 
-    # Nao vale viagem (resumido)
-    if nao_vale:
-        linhas.append("📋 *OUTRAS CIDADES (nao compensa agora)*")
-        for ev in nao_vale[:3]:
-            v = ev.get("_viagem", {})
-            cidade = EMOJI_CIDADE.get(ev.get("cidade", ""), "")
-            linhas.append(f"• {ev.get('nome', '')} | {cidade} | R${v.get('custo_estimado',0)} | {ev.get('data','')}")
-        linhas.append("")
+    # DEMAIS EVENTOS
+    ids_ja_listados = ids_urgentes | {e.get("url") for e in palestras_nao_urgentes} | {e.get("url") for e in negocios_novos}
+    demais = [e for e in novos if e.get("url") not in ids_ja_listados]
+
+    if demais:
+        linhas.append("📋 *OUTROS EVENTOS*")
+        linhas.append("─────────────────────")
+        for ev in demais[:10]:
+            emoji = EMOJI_CAT.get(ev.get("categoria","outros"),"📌")
+            cidade = ev.get("cidade","")
+            linhas.append(f"{emoji} *{ev.get('nome','')}*" + (f" | {cidade}" if cidade else ""))
+            if ev.get("data"): linhas.append(f"📆 {ev.get('data','')}")
+            if ev.get("local"): linhas.append(f"📍 {ev.get('local','')}")
+            linhas.append(f"💬 {ev.get('resumo','')}")
+            linhas.append(f"💰 {ev.get('preco','A confirmar')}")
+            linhas.append(f"🔗 {ev.get('url','')}")
+            linhas.append("")
 
     linhas.append("_Agente de Eventos FluxIA 🤖_")
     return "\n".join(linhas)
@@ -512,75 +420,66 @@ def formatar_mensagem(eventos_com_analise: list) -> str:
 # --------------------------------------------------
 
 def rodar_agente():
-    hoje = datetime.now().strftime("%d/%m/%Y")
+    hoje_dt  = date.today()
+    hoje_str = hoje_dt.strftime("%d/%m/%Y")
+
     print("=" * 50)
-    print(f"Agente de Eventos — {hoje}")
+    print(f"Agente de Eventos — {hoje_str}")
     print("=" * 50)
 
     memoria = carregar_memoria()
     print(f"Memoria: {len(memoria)} eventos ja enviados\n")
 
-    # FASE 1 — busca sem IA
+    # FASE 1 — busca
     print("FASE 1: Buscando eventos...")
     resultados_brutos = buscar_todos_eventos()
 
     if not resultados_brutos:
-        print("Nenhum resultado. Verifique TAVILY_API_KEY.")
+        print("Sem resultados. Verifique TAVILY_API_KEY.")
+        _alertar_admin("Agente de eventos: zero resultados de busca. Verifique Tavily.")
         return
 
-    # FASE 2 — extrai eventos (1 chamada IA)
+    # FASE 2 — extrai com IA
     print("\nFASE 2: Extraindo eventos com IA...")
-    eventos = extrair_eventos(resultados_brutos, hoje)
-    print(f"Eventos extraidos: {len(eventos)}")
+    eventos = extrair_eventos(resultados_brutos, hoje_str)
+    print(f"Extraidos: {len(eventos)}")
 
     if not eventos:
-        print("Nenhum evento valido encontrado.")
+        print("Nenhum evento valido.")
         return
 
-    # Filtra ja enviados
+    # FASE 3 — filtra passados (no codigo, nao so no prompt)
+    print("\nFASE 3: Filtrando eventos passados...")
+    futuros, proximos_urgentes, passados = filtrar_eventos_validos(eventos, hoje_dt)
+    print(f"Futuros: {len(futuros)} | Proximos 7 dias: {len(proximos_urgentes)} | Passados descartados: {len(passados)}")
+
+    # FASE 4 — filtra ja enviados (memoria)
+    print("\nFASE 4: Filtrando ja enviados...")
     novos = []
-    for ev in eventos:
-        ev_id = gerar_id(ev.get("url", "") or ev.get("nome", ""))
+    for ev in futuros:
+        ev_id = gerar_id(ev.get("url","") or ev.get("nome",""))
         if ev_id not in memoria:
             ev["_id"] = ev_id
             novos.append(ev)
 
-    print(f"Novos: {len(novos)}")
+    # Proximos urgentes novos (para destaque)
+    ids_novos = {e.get("url") for e in novos}
+    proximos_novos = [e for e in proximos_urgentes if e.get("url") in ids_novos]
+
+    print(f"Novos: {len(novos)} | Urgentes (7 dias): {len(proximos_novos)}")
+
     if not novos:
-        enviar_whatsapp(f"📅 *Eventos JP — {hoje}*\n\nNenhum evento novo hoje! Todos ja foram enviados. 👍")
+        enviar_whatsapp(f"📅 *Eventos — {hoje_str}*\n\nNenhum evento novo hoje! Todos ja foram enviados. 👍")
         return
 
-    # FASE 3 — pesquisa como palestrar (1 chamada por evento relevante)
-    print("\nFASE 3: Pesquisando como palestrar...")
-    for ev in novos:
-        potencial = ev.get("potencial_negocio", "baixo")
-        categoria = ev.get("categoria", "outros")
-        eh_relevante = potencial in ("alto", "medio") or categoria in ("tecnologia_ia", "negocios_empreend", "saude_clinicas")
+    # FASE 5 — formata e envia
+    mensagem = formatar_mensagem(novos, proximos_novos, hoje_str)
 
-        if eh_relevante:
-            ev["_palestra"] = pesquisar_como_palestrar(ev)
-        else:
-            ev["_palestra"] = {
-                "tem_call_for_speakers": False,
-                "como_palestrar": "",
-                "estrategia_recomendada": "",
-                "contato": "",
-            }
-        time.sleep(1)
-
-    # FASE 4 — calcula custo-beneficio viagem
-    print("\nFASE 4: Calculando custo-beneficio de viagem...")
-    for ev in novos:
-        ev["_viagem"] = calcular_custo_beneficio(ev)
-
-    # Formata e envia
-    mensagem = formatar_mensagem(novos)
-
-    caminho = f"relatorio_{datetime.now().strftime('%Y-%m-%d')}.txt"
+    caminho = f"relatorio_{hoje_dt.strftime('%Y-%m-%d')}.txt"
     with open(caminho, "w", encoding="utf-8") as f:
         f.write(mensagem)
     print(f"\nSalvo: {caminho}")
-    print(mensagem[:800])
+    print(mensagem[:600])
 
     enviado = enviar_whatsapp(mensagem)
 
@@ -591,7 +490,7 @@ def rodar_agente():
     print(f"Memoria: {len(memoria)} eventos registrados")
 
     if not enviado:
-        print("AVISO: WhatsApp nao enviado. Verifique Evolution API.")
+        print("AVISO: WhatsApp nao enviado.")
 
 
 if __name__ == "__main__":
