@@ -20,6 +20,12 @@ except Exception as e:
     print(f"ERRO ao importar agent: {e}", flush=True)
     rodar_agente = None
 
+try:
+    from painel import get_painel_html
+except Exception as e:
+    print(f"AVISO: painel.py nao carregado: {e}", flush=True)
+    get_painel_html = None
+
 HORA_EXECUCAO = int(os.environ.get("HORA_EXECUCAO", "7"))
 print(f"Hora de execucao configurada: {HORA_EXECUCAO}h", flush=True)
 
@@ -28,7 +34,22 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         agora = datetime.now().strftime("%d/%m/%Y %H:%M")
 
-        if self.path == "/testar":
+        if self.path == "/painel":
+            status = {
+                "uptime": f"{RODANDO.get('iniciado_em', '—')}",
+                "ultimo_disparo": RODANDO.get("ultima_execucao", "—"),
+                "proximo_disparo": f"hoje as {HORA_EXECUCAO}h",
+            }
+            if get_painel_html:
+                html = get_painel_html(status)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(html.encode("utf-8"))
+            else:
+                self._responder("Painel nao disponivel — verifique painel.py")
+
+        elif self.path == "/testar":
             self.send_response(200)
             self.end_headers()
             if rodar_agente is None:
